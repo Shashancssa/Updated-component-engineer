@@ -118,7 +118,7 @@ def add_enrichment_fields(parts, attributes, pricing):
     """
     if not isinstance(parts, list):
         return []
-    msd = _extract_attribute_value(attributes, "msl", "msd", "moisture sensitivity")
+    msd = _extract_attribute_value(attributes, "msl", "msd", "moisture sensitivity", "moisture sensitive")
     reflow = _extract_attribute_value(attributes, "reflow")
     thermal_cycle = _extract_attribute_value(attributes, "thermal cycle")
     wave = _extract_attribute_value(attributes, "wave solder")
@@ -200,7 +200,7 @@ def import_unified_from_excel(file_obj):
         "stock": ["stock", "quantity available"],
         "datasheet_url": ["datasheetlink", "datasheet", "data sheet url"],
         "product_url": ["product url"],
-        "msd_level": ["msd level", "msl"],
+        "msd_level": ["msd level", "msl", "moisture sensitivity level", "moisture sensitive level"],
         "reflow_soldering_temperature": ["reflow soldering temperature", "reflow temperature"],
         "thermal_cycle": ["thermal cycle", "reflow cycle"],
         "wave_soldering_temperature": ["wave soldering temperature", "wave solder"],
@@ -1008,6 +1008,84 @@ def ensure_scrub_queue_tables():
         conn.commit()
 
 
+def ensure_base_scraper_tables():
+    """
+    Ensure core scraper tables exist so UI queries don't crash on a fresh DB.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mpn TEXT NOT NULL,
+                section_name TEXT NOT NULL,
+                section_order INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tables (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mpn TEXT NOT NULL,
+                section_name TEXT NOT NULL,
+                title TEXT NOT NULL,
+                table_index INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cells (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_id INTEGER NOT NULL,
+                row_index INTEGER NOT NULL,
+                col_index INTEGER NOT NULL,
+                header TEXT,
+                value TEXT,
+                FOREIGN KEY(table_id) REFERENCES tables(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.commit()
+
+
+def _table_exists(conn, table_name):
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (str(table_name).strip(),),
+    ).fetchone()
+    return bool(row)
+
+
+def get_available_db_mpns():
+    """
+    Return MPN list from whichever tables are currently available.
+    Preference: sections -> unified_part_cache -> live_part_cache.
+    """
+    candidates = []
+    with sqlite3.connect(DB_PATH) as conn:
+        if _table_exists(conn, "sections"):
+            try:
+                df = pd.read_sql("SELECT DISTINCT mpn FROM sections ORDER BY mpn", conn)
+                candidates.extend(df.get("mpn", []).tolist())
+            except Exception:
+                pass
+        if _table_exists(conn, "unified_part_cache"):
+            try:
+                df = pd.read_sql("SELECT DISTINCT mpn FROM unified_part_cache ORDER BY mpn", conn)
+                candidates.extend(df.get("mpn", []).tolist())
+            except Exception:
+                pass
+        if _table_exists(conn, "live_part_cache"):
+            try:
+                df = pd.read_sql("SELECT DISTINCT mpn FROM live_part_cache ORDER BY mpn", conn)
+                candidates.extend(df.get("mpn", []).tolist())
+            except Exception:
+                pass
+    return sorted(dict.fromkeys([str(x).strip() for x in candidates if str(x).strip()]))
+
+
 def _first_non_empty(values):
     for v in values:
         if not _is_effectively_empty(v):
@@ -1158,7 +1236,9 @@ def upsert_unified_part_for_mpn(mpn):
         unified["stock"] = unified["stock"] or from_scraper("stock", "quantity available")
         unified["datasheet_url"] = unified["datasheet_url"] or from_scraper("datasheet", "data sheet url")
         unified["product_url"] = unified["product_url"] or from_scraper("product url")
-        unified["msd_level"] = unified["msd_level"] or from_scraper("msd level", "msl", "moisture sensitivity level")
+        unified["msd_level"] = unified["msd_level"] or from_scraper(
+            "msd level", "msl", "moisture sensitivity level", "moisture sensitive level"
+        )
         unified["reflow_soldering_temperature"] = unified["reflow_soldering_temperature"] or from_scraper(
             "reflow soldering temperature", "reflow temperature", "maximum reflow temperature"
         )
@@ -2077,6 +2157,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
 # ==========================================
 
 run_mode = show_sidebar_logo()
+ensure_base_scraper_tables()
 ensure_live_cache_table()
 ensure_unified_parts_table()
 ensure_z2_spec_tables()
@@ -2694,8 +2775,9 @@ with ui_tabs[4]:
         if not DB_PATH.exists():
             st.info("Database missing. Upload file mode is still available.")
         else:
-            with sqlite3.connect(DB_PATH) as conn:
-                db_mpns = pd.read_sql("SELECT DISTINCT mpn FROM sections ORDER BY mpn", conn)["mpn"].tolist()
+            db_mpns = get_available_db_mpns()
+            if not db_mpns:
+                st.info("No MPNs found yet. Run scraper/import first, or use Upload mode.")
             selected_mpns = st.multiselect("Select MPNs to fetch from Mouser:", db_mpns)
     else:
         up = st.file_uploader("Upload MPN list (Excel/CSV, first column used)", type=["xlsx", "csv"], key="mouser_upload")
