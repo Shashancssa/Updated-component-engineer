@@ -265,7 +265,7 @@ def import_unified_from_excel(file_obj):
                 """
                 INSERT OR REPLACE INTO unified_part_cache
                 (mpn, manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, component_thickness, reach, reflow_soldering_time, wave_soldering_time, body_mark, source_trace, updated_at_utc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     merged["mpn"], merged["manufacturer"], merged["manufacturer_part_number"], merged["supplier_part_number"],
@@ -1267,7 +1267,7 @@ def upsert_unified_part_for_mpn(mpn):
             """
             INSERT OR REPLACE INTO unified_part_cache
             (mpn, manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, component_thickness, reach, reflow_soldering_time, wave_soldering_time, body_mark, source_trace, updated_at_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 unified["mpn"], unified["manufacturer"], unified["manufacturer_part_number"], unified["supplier_part_number"],
