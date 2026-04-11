@@ -42,8 +42,8 @@ DEV_INFO = "Developed by :- Shashank C | Mail ID:- shashank.c@kaynestechnology.n
 MOUSER_API_KEY_FALLBACK = os.getenv("MOUSER_API_KEY", "a5d0cdf4-c5b6-4600-88ab-12290f19e2cc")
 DIGIKEY_CLIENT_ID_FALLBACK = os.getenv("DIGIKEY_CLIENT_ID", "AyNFvUvmDoGUTtIyeDAhqE1BsHzQ9HNlMM2CoKurruURHJPl")
 DIGIKEY_CLIENT_SECRET_FALLBACK = os.getenv("DIGIKEY_CLIENT_SECRET", "k5bDnbn49OFWrYQtuQlAgG2YOdeLrr5BCxK8eihKJzDTz3WHQBpnGkN84lLKdwQE")
-NEXAR_CLIENT_ID_FALLBACK = os.getenv("NEXAR_CLIENT_ID", "")
-NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "")
+NEXAR_CLIENT_ID_FALLBACK = os.getenv("NEXAR_CLIENT_ID", "2000628d-be02-44fc-bfff-f7a90ad13926")
+NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "ECZ622yjXXrCVDpXOmgJHrulfQI3AWJh_sz0")
 _DIGIKEY_TOKEN_CACHE = {}
 
 st.set_page_config(layout="wide", page_title="COMPONENT ENGINEER DATABASE", page_icon="🛡️")
@@ -103,6 +103,13 @@ def _extract_price_summary(pricing_rows):
     return ""
 
 
+def _is_effectively_empty(value):
+    txt = str(value or "").strip()
+    if not txt:
+        return True
+    return txt.lower() in {"none", "null", "nan", "n/a", "na", "-"}
+
+
 def add_enrichment_fields(parts, attributes, pricing):
     """
     Add normalized fields requested for DB/export compatibility:
@@ -111,13 +118,18 @@ def add_enrichment_fields(parts, attributes, pricing):
     """
     if not isinstance(parts, list):
         return []
-    msd = _extract_attribute_value(attributes, "msl", "msd", "moisture sensitivity")
+    msd = _extract_attribute_value(attributes, "msl", "msd", "moisture sensitivity", "moisture sensitive")
     reflow = _extract_attribute_value(attributes, "reflow")
     thermal_cycle = _extract_attribute_value(attributes, "thermal cycle")
     wave = _extract_attribute_value(attributes, "wave solder")
     operating_temp = _extract_attribute_value(attributes, "operating temperature", "temperature range", "operating temp")
     lsl = _extract_attribute_value(attributes, "lsl", "land side", "lead surface")
     package = _extract_attribute_value(attributes, "package", "case", "mounting package")
+    component_thickness = _extract_attribute_value(attributes, "component thickness", "thickness", "height")
+    reach = _extract_attribute_value(attributes, "reach")
+    reflow_time = _extract_attribute_value(attributes, "reflow soldering time", "reflow time", "time at reflow")
+    wave_time = _extract_attribute_value(attributes, "wave soldering time", "wave time")
+    body_mark = _extract_attribute_value(attributes, "body mark", "marking")
     price_details = _extract_price_summary(pricing)
     for row in parts:
         if not isinstance(row, dict):
@@ -130,6 +142,11 @@ def add_enrichment_fields(parts, attributes, pricing):
         row["PACKAGE"] = row.get("PACKAGE", "") or package
         row["PRICE DETAILS"] = row.get("PRICE DETAILS", "") or price_details
         row["OPERATING TEMPERATURE"] = row.get("OPERATING TEMPERATURE", "") or operating_temp
+        row["COMPONENT THICKNESS"] = row.get("COMPONENT THICKNESS", "") or component_thickness
+        row["REACH"] = row.get("REACH", "") or reach
+        row["REFLOW SOLDERING TIME"] = row.get("REFLOW SOLDERING TIME", "") or reflow_time
+        row["WAVE SOLDERING TIME"] = row.get("WAVE SOLDERING TIME", "") or wave_time
+        row["BODY MARK"] = row.get("BODY MARK", "") or body_mark
         row["DATASHEETLINK"] = row.get("DATASHEETLINK", "") or row.get("Data Sheet URL", "")
     return parts
 
@@ -183,7 +200,7 @@ def import_unified_from_excel(file_obj):
         "stock": ["stock", "quantity available"],
         "datasheet_url": ["datasheetlink", "datasheet", "data sheet url"],
         "product_url": ["product url"],
-        "msd_level": ["msd level", "msl"],
+        "msd_level": ["msd level", "msl", "moisture sensitivity level", "moisture sensitive level"],
         "reflow_soldering_temperature": ["reflow soldering temperature", "reflow temperature"],
         "thermal_cycle": ["thermal cycle", "reflow cycle"],
         "wave_soldering_temperature": ["wave soldering temperature", "wave solder"],
@@ -191,6 +208,11 @@ def import_unified_from_excel(file_obj):
         "package_details": ["package", "package details"],
         "price_details": ["price details", "price"],
         "operating_temperature": ["operating temperature", "temp range", "temperature range"],
+        "component_thickness": ["component thickness", "thickness", "height"],
+        "reach": ["reach", "reach status"],
+        "reflow_soldering_time": ["reflow soldering time", "reflow time"],
+        "wave_soldering_time": ["wave soldering time", "wave time"],
+        "body_mark": ["body mark", "marking"],
     }
 
     def _pick_value(row, key):
@@ -219,7 +241,8 @@ def import_unified_from_excel(file_obj):
         "mpn", "manufacturer", "manufacturer_part_number", "supplier_part_number", "description", "category",
         "lifecycle_status", "rohs", "stock", "datasheet_url", "product_url", "msd_level",
         "reflow_soldering_temperature", "thermal_cycle", "wave_soldering_temperature", "lsl_details",
-        "package_details", "price_details", "operating_temperature", "source_trace"
+        "package_details", "price_details", "operating_temperature", "component_thickness",
+        "reach", "reflow_soldering_time", "wave_soldering_time", "body_mark", "source_trace"
     ]
     with sqlite3.connect(DB_PATH) as conn:
         for _, row in df.iterrows():
@@ -228,7 +251,7 @@ def import_unified_from_excel(file_obj):
                 skipped += 1
                 continue
             current = conn.execute(
-                "SELECT manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, source_trace FROM unified_part_cache WHERE mpn=?",
+                "SELECT manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, component_thickness, reach, reflow_soldering_time, wave_soldering_time, body_mark, source_trace FROM unified_part_cache WHERE mpn=?",
                 (mpn,),
             ).fetchone()
             existing = dict(zip(cols[1:], current)) if current else {k: "" for k in cols[1:]}
@@ -241,15 +264,16 @@ def import_unified_from_excel(file_obj):
             conn.execute(
                 """
                 INSERT OR REPLACE INTO unified_part_cache
-                (mpn, manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, source_trace, updated_at_utc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (mpn, manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, component_thickness, reach, reflow_soldering_time, wave_soldering_time, body_mark, source_trace, updated_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     merged["mpn"], merged["manufacturer"], merged["manufacturer_part_number"], merged["supplier_part_number"],
                     merged["description"], merged["category"], merged["lifecycle_status"], merged["rohs"], merged["stock"],
                     merged["datasheet_url"], merged["product_url"], merged["msd_level"], merged["reflow_soldering_temperature"],
                     merged["thermal_cycle"], merged["wave_soldering_temperature"], merged["lsl_details"], merged["package_details"],
-                    merged["price_details"], merged["operating_temperature"], merged["source_trace"], datetime.now(timezone.utc).isoformat(),
+                    merged["price_details"], merged["operating_temperature"], merged["component_thickness"], merged["reach"],
+                    merged["reflow_soldering_time"], merged["wave_soldering_time"], merged["body_mark"], merged["source_trace"], datetime.now(timezone.utc).isoformat(),
                 ),
             )
             loaded += 1
@@ -914,6 +938,11 @@ def ensure_unified_parts_table():
                 package_details TEXT,
                 price_details TEXT,
                 operating_temperature TEXT,
+                component_thickness TEXT,
+                reach TEXT,
+                reflow_soldering_time TEXT,
+                wave_soldering_time TEXT,
+                body_mark TEXT,
                 source_trace TEXT,
                 updated_at_utc TEXT NOT NULL
             );
@@ -932,6 +961,11 @@ def ensure_unified_parts_table():
             "package_details": "TEXT",
             "price_details": "TEXT",
             "operating_temperature": "TEXT",
+            "component_thickness": "TEXT",
+            "reach": "TEXT",
+            "reflow_soldering_time": "TEXT",
+            "wave_soldering_time": "TEXT",
+            "body_mark": "TEXT",
         }
         for col, col_type in required.items():
             if col not in existing_cols:
@@ -974,22 +1008,100 @@ def ensure_scrub_queue_tables():
         conn.commit()
 
 
+def ensure_base_scraper_tables():
+    """
+    Ensure core scraper tables exist so UI queries don't crash on a fresh DB.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mpn TEXT NOT NULL,
+                section_name TEXT NOT NULL,
+                section_order INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tables (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mpn TEXT NOT NULL,
+                section_name TEXT NOT NULL,
+                title TEXT NOT NULL,
+                table_index INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cells (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_id INTEGER NOT NULL,
+                row_index INTEGER NOT NULL,
+                col_index INTEGER NOT NULL,
+                header TEXT,
+                value TEXT,
+                FOREIGN KEY(table_id) REFERENCES tables(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.commit()
+
+
+def _table_exists(conn, table_name):
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (str(table_name).strip(),),
+    ).fetchone()
+    return bool(row)
+
+
+def get_available_db_mpns():
+    """
+    Return MPN list from whichever tables are currently available.
+    Preference: sections -> unified_part_cache -> live_part_cache.
+    """
+    candidates = []
+    with sqlite3.connect(DB_PATH) as conn:
+        if _table_exists(conn, "sections"):
+            try:
+                df = pd.read_sql("SELECT DISTINCT mpn FROM sections ORDER BY mpn", conn)
+                candidates.extend(df.get("mpn", []).tolist())
+            except Exception:
+                pass
+        if _table_exists(conn, "unified_part_cache"):
+            try:
+                df = pd.read_sql("SELECT DISTINCT mpn FROM unified_part_cache ORDER BY mpn", conn)
+                candidates.extend(df.get("mpn", []).tolist())
+            except Exception:
+                pass
+        if _table_exists(conn, "live_part_cache"):
+            try:
+                df = pd.read_sql("SELECT DISTINCT mpn FROM live_part_cache ORDER BY mpn", conn)
+                candidates.extend(df.get("mpn", []).tolist())
+            except Exception:
+                pass
+    return sorted(dict.fromkeys([str(x).strip() for x in candidates if str(x).strip()]))
+
+
 def _first_non_empty(values):
     for v in values:
-        if str(v).strip():
-            return v
+        if not _is_effectively_empty(v):
+            return str(v).strip()
     return ""
 
 
 def _as_text(value):
-    if value is None:
+    if _is_effectively_empty(value):
         return ""
     if isinstance(value, (dict, list, tuple, set)):
         try:
             return json.dumps(value, ensure_ascii=False)
         except Exception:
             return str(value)
-    return str(value)
+    return str(value).strip()
 
 
 def upsert_unified_part_for_mpn(mpn):
@@ -1004,6 +1116,7 @@ def upsert_unified_part_for_mpn(mpn):
         "datasheet_url": "", "product_url": "", "msd_level": "",
         "reflow_soldering_temperature": "", "thermal_cycle": "",
         "wave_soldering_temperature": "", "lsl_details": "", "package_details": "", "price_details": "", "operating_temperature": "",
+        "component_thickness": "", "reach": "", "reflow_soldering_time": "", "wave_soldering_time": "", "body_mark": "",
     }
     used_sources = []
     with sqlite3.connect(DB_PATH) as conn:
@@ -1012,7 +1125,8 @@ def upsert_unified_part_for_mpn(mpn):
             SELECT manufacturer, manufacturer_part_number, supplier_part_number, description, category,
                    lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level,
                    reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature,
-                   lsl_details, package_details, price_details, operating_temperature, source_trace
+                   lsl_details, package_details, price_details, operating_temperature,
+                   component_thickness, reach, reflow_soldering_time, wave_soldering_time, body_mark, source_trace
             FROM unified_part_cache WHERE mpn=?
             """,
             (mpn,),
@@ -1022,7 +1136,8 @@ def upsert_unified_part_for_mpn(mpn):
                 "manufacturer", "manufacturer_part_number", "supplier_part_number", "description", "category",
                 "lifecycle_status", "rohs", "stock", "datasheet_url", "product_url", "msd_level",
                 "reflow_soldering_temperature", "thermal_cycle", "wave_soldering_temperature",
-                "lsl_details", "package_details", "price_details", "operating_temperature", "source_trace",
+                "lsl_details", "package_details", "price_details", "operating_temperature",
+                "component_thickness", "reach", "reflow_soldering_time", "wave_soldering_time", "body_mark", "source_trace",
             ]
             existing_row = dict(zip(current_cols, current))
             for k in unified.keys():
@@ -1038,7 +1153,7 @@ def upsert_unified_part_for_mpn(mpn):
             conn,
             params=(mpn,),
         )
-        source_priority = {"Source A": 1, "Source B": 2, "Nexar": 3}
+        source_priority = {"Source B": 1, "Nexar": 2, "Source A": 3}
         if not live_df.empty:
             live_df["priority"] = live_df["selected_source"].map(source_priority).fillna(99)
             live_df = live_df.sort_values(["priority", "fetched_at_utc"], ascending=[True, False])
@@ -1073,6 +1188,11 @@ def upsert_unified_part_for_mpn(mpn):
             unified["package_details"] = unified["package_details"] or _as_text(p.get("PACKAGE", ""))
             unified["price_details"] = unified["price_details"] or _as_text(p.get("PRICE DETAILS", ""))
             unified["operating_temperature"] = unified["operating_temperature"] or _as_text(p.get("OPERATING TEMPERATURE", ""))
+            unified["component_thickness"] = unified["component_thickness"] or _as_text(p.get("COMPONENT THICKNESS", ""))
+            unified["reach"] = unified["reach"] or _as_text(p.get("REACH", ""))
+            unified["reflow_soldering_time"] = unified["reflow_soldering_time"] or _as_text(p.get("REFLOW SOLDERING TIME", ""))
+            unified["wave_soldering_time"] = unified["wave_soldering_time"] or _as_text(p.get("WAVE SOLDERING TIME", ""))
+            unified["body_mark"] = unified["body_mark"] or _as_text(p.get("BODY MARK", ""))
             used_sources.append(source)
 
         scraper_map = {}
@@ -1116,7 +1236,9 @@ def upsert_unified_part_for_mpn(mpn):
         unified["stock"] = unified["stock"] or from_scraper("stock", "quantity available")
         unified["datasheet_url"] = unified["datasheet_url"] or from_scraper("datasheet", "data sheet url")
         unified["product_url"] = unified["product_url"] or from_scraper("product url")
-        unified["msd_level"] = unified["msd_level"] or from_scraper("msd level", "msl", "moisture sensitivity level")
+        unified["msd_level"] = unified["msd_level"] or from_scraper(
+            "msd level", "msl", "moisture sensitivity level", "moisture sensitive level"
+        )
         unified["reflow_soldering_temperature"] = unified["reflow_soldering_temperature"] or from_scraper(
             "reflow soldering temperature", "reflow temperature", "maximum reflow temperature"
         )
@@ -1130,6 +1252,11 @@ def upsert_unified_part_for_mpn(mpn):
         unified["package_details"] = unified["package_details"] or from_scraper("package", "package/case", "packaging")
         unified["price_details"] = unified["price_details"] or from_scraper("price details", "price")
         unified["operating_temperature"] = unified["operating_temperature"] or from_scraper("operating temperature", "temperature range")
+        unified["component_thickness"] = unified["component_thickness"] or from_scraper("component thickness", "thickness", "height")
+        unified["reach"] = unified["reach"] or from_scraper("reach", "reach status")
+        unified["reflow_soldering_time"] = unified["reflow_soldering_time"] or from_scraper("reflow soldering time", "reflow time")
+        unified["wave_soldering_time"] = unified["wave_soldering_time"] or from_scraper("wave soldering time", "wave time")
+        unified["body_mark"] = unified["body_mark"] or from_scraper("body mark", "marking")
         if scraper_map:
             used_sources.append("ScraperDB")
 
@@ -1139,15 +1266,16 @@ def upsert_unified_part_for_mpn(mpn):
         conn.execute(
             """
             INSERT OR REPLACE INTO unified_part_cache
-            (mpn, manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, source_trace, updated_at_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (mpn, manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, component_thickness, reach, reflow_soldering_time, wave_soldering_time, body_mark, source_trace, updated_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 unified["mpn"], unified["manufacturer"], unified["manufacturer_part_number"], unified["supplier_part_number"],
                 unified["description"], unified["category"], unified["lifecycle_status"], unified["rohs"], unified["stock"],
                 unified["datasheet_url"], unified["product_url"], unified["msd_level"], unified["reflow_soldering_temperature"],
                 unified["thermal_cycle"], unified["wave_soldering_temperature"], unified["lsl_details"], unified["package_details"], unified["price_details"],
-                unified["operating_temperature"], ", ".join(dict.fromkeys([s for s in used_sources if s])),
+                unified["operating_temperature"], unified["component_thickness"], unified["reach"], unified["reflow_soldering_time"],
+                unified["wave_soldering_time"], unified["body_mark"], ", ".join(dict.fromkeys([s for s in used_sources if s])),
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
@@ -1796,17 +1924,17 @@ def save_live_payload_to_cells(mpn, payload, section_name="Live Combo", title="D
 
 
 def _rotating_priority_for_index(idx, split_mode=False):
-    default_order = ["digikey", "mouser", "octopart"]
+    default_order = ["digikey", "octopart", "mouser"]
     if not split_mode:
         return default_order
-    rr_base = ["mouser", "digikey", "octopart"]
+    rr_base = ["digikey", "octopart", "mouser"]
     start = int(idx) % len(rr_base)
     return rr_base[start:] + rr_base[:start]
 
 
 def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", nexar_id="", nexar_secret="", priority_order=None, save_to_cells=False, fill_empty_from_fallback=True):
     """
-    For missing scraper MPNs, fetch from live sources (default priority: Digi-Key -> Mouser -> Nexar)
+    For missing scraper MPNs, fetch from live sources (default priority: Digi-Key -> Octopart/Nexar -> Mouser)
     and save into same DB via live_part_cache + unified_part_cache.
     """
     def _merge_payload_for_mpn(one_mpn):
@@ -1825,7 +1953,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
 
         payloads = []
         sources = []
-        provider_order = priority_order or ["digikey", "mouser", "nexar"]
+        provider_order = priority_order or ["digikey", "octopart", "mouser"]
         best_part = {}
         for provider in provider_order:
             p = str(provider).strip().lower()
@@ -2029,6 +2157,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
 # ==========================================
 
 run_mode = show_sidebar_logo()
+ensure_base_scraper_tables()
 ensure_live_cache_table()
 ensure_unified_parts_table()
 ensure_z2_spec_tables()
@@ -2086,7 +2215,7 @@ with ui_tabs[0]:
 
     st.markdown("---")
     st.subheader("Live Combo Scraper → DB Cells")
-    st.caption("Priority used: Digi-Key → Mouser → Octopart. Results are written directly to DB cells.")
+    st.caption("Priority used: Digi-Key → Octopart/Nexar → Mouser. Results are written directly to DB cells.")
     live_up = st.file_uploader("Upload MPN List for Live Combo Scraper", type=["xlsx", "csv"], key="live_combo_upload")
     live_manual = st.text_area("Or enter MPNs (comma/newline separated)", key="live_combo_manual")
     lc1, lc2 = st.columns(2)
@@ -2096,7 +2225,7 @@ with ui_tabs[0]:
     live_mouser = lc2.text_input("Mouser API Key (Optional)", value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK), type="password", key="live_combo_mouser")
     live_nexar_id = lc2.text_input("Octopart/Nexar Client ID (Optional)", value=NEXAR_CLIENT_ID_FALLBACK, key="live_combo_nexar_id")
     live_nexar_secret = lc2.text_input("Octopart/Nexar Client Secret (Optional)", value=NEXAR_CLIENT_SECRET_FALLBACK, type="password", key="live_combo_nexar_secret")
-    live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Mouser → Digi-Key → Octopart)", value=True, key="live_combo_split_mode")
+    live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Octopart → Mouser)", value=True, key="live_combo_split_mode")
     live_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="live_combo_fill_empty")
     if st.button("Start Live Combo Scraper", key="live_combo_run"):
         live_mpns = []
@@ -2135,17 +2264,6 @@ with ui_tabs[0]:
     st.markdown("---")
     st.subheader("Large File Background Queue (Resume Supported)")
     st.caption("For 50k+ rows: upload once, process in batches, stop anytime, and resume from last processed MPN.")
-    bg_file = st.file_uploader("Upload full MPN file (col1=MPN, col2=Manufacturer/Make optional)", type=["xlsx", "csv"], key="bg_queue_upload")
-    b1, b2, b3 = st.columns(3)
-    if b1.button("📥 Add file to queue", key="bg_enqueue_btn"):
-        out = enqueue_scrub_queue_from_upload(bg_file)
-        if out.get("error"):
-            st.error(out["error"])
-        else:
-            st.success(f"Queued {out['queued']} MPNs. Skipped {out['skipped']} duplicates/blank rows.")
-    bg_batch_size = b2.number_input("Batch size", min_value=1, max_value=5000, value=200, step=50, key="bg_batch_size")
-    run_batch = b3.button("▶ Run next batch", key="bg_run_batch_btn")
-
     bgc1, bgc2 = st.columns(2)
     bg_mouser = bgc1.text_input("Queue Mouser API Key", value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK), type="password", key="bg_mouser")
     bg_dk_id = bgc1.text_input("Queue Digi-Key Client ID", value=os.getenv("DIGIKEY_CLIENT_ID", DIGIKEY_CLIENT_ID_FALLBACK), key="bg_dk_id")
@@ -2154,6 +2272,34 @@ with ui_tabs[0]:
     bg_nexar_id = bgc2.text_input("Queue Octopart/Nexar Client ID", value=NEXAR_CLIENT_ID_FALLBACK, key="bg_nexar_id")
     bg_nexar_secret = bgc2.text_input("Queue Octopart/Nexar Client Secret", value=NEXAR_CLIENT_SECRET_FALLBACK, type="password", key="bg_nexar_secret")
     bg_fill_empty = bgc2.toggle("Queue fallback fill empty fields", value=True, key="bg_fill_empty")
+    auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
+
+    bg_file = st.file_uploader("Upload full MPN file (col1=MPN, col2=Manufacturer/Make optional)", type=["xlsx", "csv"], key="bg_queue_upload")
+    b1, b2, b3 = st.columns(3)
+    bg_batch_size = b2.number_input("Batch size", min_value=1, max_value=5000, value=200, step=50, key="bg_batch_size")
+    run_batch = b3.button("▶ Run next batch", key="bg_run_batch_btn")
+    if b1.button("📥 Add file to queue", key="bg_enqueue_btn"):
+        out = enqueue_scrub_queue_from_upload(bg_file)
+        if out.get("error"):
+            st.error(out["error"])
+        else:
+            st.success(f"Queued {out['queued']} MPNs. Skipped {out['skipped']} duplicates/blank rows.")
+            if auto_run_on_enqueue and int(out.get("queued", 0) or 0) > 0:
+                processed = process_scrub_queue_batch(
+                    int(bg_batch_size),
+                    mouser_key=bg_mouser,
+                    digikey_id=bg_dk_id,
+                    digikey_secret=bg_dk_secret,
+                    digikey_scope=bg_dk_scope,
+                    nexar_id=bg_nexar_id,
+                    nexar_secret=bg_nexar_secret,
+                    fill_empty_from_fallback=bg_fill_empty,
+                )
+                if processed:
+                    st.success(f"Auto-run started immediately and processed {len(processed)} queued rows.")
+                    st.dataframe(pd.DataFrame(processed), width="stretch")
+                else:
+                    st.info("Auto-run was enabled, but no rows were processed in the first batch.")
 
     if run_batch:
         processed = process_scrub_queue_batch(
@@ -2413,6 +2559,11 @@ with ui_tabs[3]:
                 "package_details": "PACKAGE",
                 "price_details": "PRICE DETAILS",
                 "operating_temperature": "OPERATING TEMPERATURE",
+                "component_thickness": "Component thickness",
+                "reach": "Reach",
+                "reflow_soldering_time": "Reflow soldering time",
+                "wave_soldering_time": "Wave soldering time",
+                "body_mark": "Body mark",
             }
             export_df = udf.rename(columns=rename_map)
             export_cols = [
@@ -2431,6 +2582,11 @@ with ui_tabs[3]:
                 "PACKAGE",
                 "PRICE DETAILS",
                 "OPERATING TEMPERATURE",
+                "Component thickness",
+                "Reach",
+                "Reflow soldering time",
+                "Wave soldering time",
+                "Body mark",
             ]
             for c in export_cols:
                 if c not in export_df.columns:
@@ -2477,6 +2633,11 @@ with ui_tabs[3]:
         manual_package = n2.text_input("PACKAGE")
         manual_price = n2.text_input("PRICE DETAILS")
         manual_operating = n2.text_input("OPERATING TEMPERATURE")
+        manual_component_thickness = n3.text_input("Component thickness")
+        manual_reach = n3.text_input("Reach")
+        manual_reflow_time = n3.text_input("Reflow soldering time")
+        manual_wave_time = n3.text_input("Wave soldering time")
+        manual_body_mark = n3.text_input("Body mark")
         manual_source = n3.text_input("Source Trace", value="ManualEntry")
         save_manual = st.form_submit_button("💾 Save Manual Entry")
 
@@ -2497,8 +2658,8 @@ with ui_tabs[3]:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO unified_part_cache
-                    (mpn, manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, source_trace, updated_at_utc)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (mpn, manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, component_thickness, reach, reflow_soldering_time, wave_soldering_time, body_mark, source_trace, updated_at_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         manual_mpn.strip(),
@@ -2520,6 +2681,11 @@ with ui_tabs[3]:
                         manual_package.strip(),
                         manual_price.strip(),
                         manual_operating.strip(),
+                        manual_component_thickness.strip(),
+                        manual_reach.strip(),
+                        manual_reflow_time.strip(),
+                        manual_wave_time.strip(),
+                        manual_body_mark.strip(),
                         manual_source.strip() or "ManualEntry",
                         datetime.now(timezone.utc).isoformat(),
                     ),
@@ -2609,8 +2775,9 @@ with ui_tabs[4]:
         if not DB_PATH.exists():
             st.info("Database missing. Upload file mode is still available.")
         else:
-            with sqlite3.connect(DB_PATH) as conn:
-                db_mpns = pd.read_sql("SELECT DISTINCT mpn FROM sections ORDER BY mpn", conn)["mpn"].tolist()
+            db_mpns = get_available_db_mpns()
+            if not db_mpns:
+                st.info("No MPNs found yet. Run scraper/import first, or use Upload mode.")
             selected_mpns = st.multiselect("Select MPNs to fetch from Mouser:", db_mpns)
     else:
         up = st.file_uploader("Upload MPN list (Excel/CSV, first column used)", type=["xlsx", "csv"], key="mouser_upload")
