@@ -2,6 +2,16 @@
 
 ## Excel to DB import format
 
+## Initialize local database
+
+Run this once in the project folder to create `components.db` with the required tables:
+
+```bash
+python init_components_db.py
+```
+
+`components.db` is intentionally not committed as a binary file; generate it locally with the command above.
+
 Use the following column order in Excel/CSV before loading to the database:
 
 1. `mpn`
@@ -49,5 +59,5 @@ Reference files:
    - `create_startup_task.bat "C:\full\path\to\dist\ComponentEngineer.exe"`
 
 Notes:
-- `build_windows_exe.bat` bundles `logo.png` and `components.db`.
+- `build_windows_exe.bat` bundles `logo.png` and `components.db` (generate `components.db` first with `python init_components_db.py`).
 - Startup task is created with name `ComponentEngineerAutoStart` and trigger `ONLOGON`.
