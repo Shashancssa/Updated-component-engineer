@@ -42,8 +42,8 @@ DEV_INFO = "Developed by :- Shashank C | Mail ID:- shashank.c@kaynestechnology.n
 MOUSER_API_KEY_FALLBACK = os.getenv("MOUSER_API_KEY", "a5d0cdf4-c5b6-4600-88ab-12290f19e2cc")
 DIGIKEY_CLIENT_ID_FALLBACK = os.getenv("DIGIKEY_CLIENT_ID", "AyNFvUvmDoGUTtIyeDAhqE1BsHzQ9HNlMM2CoKurruURHJPl")
 DIGIKEY_CLIENT_SECRET_FALLBACK = os.getenv("DIGIKEY_CLIENT_SECRET", "k5bDnbn49OFWrYQtuQlAgG2YOdeLrr5BCxK8eihKJzDTz3WHQBpnGkN84lLKdwQE")
-NEXAR_CLIENT_ID_FALLBACK = os.getenv("NEXAR_CLIENT_ID", "")
-NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "")
+NEXAR_CLIENT_ID_FALLBACK = os.getenv("NEXAR_CLIENT_ID", "2000628d-be02-44fc-bfff-f7a90ad13926")
+NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "ECZ622yjXXrCVDpXOmgJHrulfQI3AWJh_sz0")
 _DIGIKEY_TOKEN_CACHE = {}
 
 st.set_page_config(layout="wide", page_title="COMPONENT ENGINEER DATABASE", page_icon="🛡️")
@@ -1796,17 +1796,17 @@ def save_live_payload_to_cells(mpn, payload, section_name="Live Combo", title="D
 
 
 def _rotating_priority_for_index(idx, split_mode=False):
-    default_order = ["digikey", "mouser", "octopart"]
+    default_order = ["digikey", "octopart", "mouser"]
     if not split_mode:
         return default_order
-    rr_base = ["mouser", "digikey", "octopart"]
+    rr_base = ["digikey", "octopart", "mouser"]
     start = int(idx) % len(rr_base)
     return rr_base[start:] + rr_base[:start]
 
 
 def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", nexar_id="", nexar_secret="", priority_order=None, save_to_cells=False, fill_empty_from_fallback=True):
     """
-    For missing scraper MPNs, fetch from live sources (default priority: Digi-Key -> Mouser -> Nexar)
+    For missing scraper MPNs, fetch from live sources (default priority: Digi-Key -> Octopart/Nexar -> Mouser)
     and save into same DB via live_part_cache + unified_part_cache.
     """
     def _merge_payload_for_mpn(one_mpn):
@@ -1825,7 +1825,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
 
         payloads = []
         sources = []
-        provider_order = priority_order or ["digikey", "mouser", "nexar"]
+        provider_order = priority_order or ["digikey", "octopart", "mouser"]
         best_part = {}
         for provider in provider_order:
             p = str(provider).strip().lower()
