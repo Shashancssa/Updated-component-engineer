@@ -1021,26 +1021,52 @@ def ensure_scrub_queue_tables():
         conn.commit()
 
 
-def log_scrub_history(mpn, step, status, message="", source=""):
+def log_scrub_history(mpn, step, status, message="", source="", conn=None):
     mpn = str(mpn or "").strip()
     if not mpn:
         return
-    with sqlite3.connect(DB_PATH) as conn:
+    params = (
+        mpn,
+        str(step or "").strip() or "unknown",
+        str(status or "").strip() or "info",
+        str(source or "").strip(),
+        str(message or "").strip(),
+        datetime.now(timezone.utc).isoformat(),
+    )
+    if conn is not None:
         conn.execute(
             """
             INSERT INTO scrub_queue_history (mpn, step, status, source, message, created_at_utc)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (
-                mpn,
-                str(step or "").strip() or "unknown",
-                str(status or "").strip() or "info",
-                str(source or "").strip(),
-                str(message or "").strip(),
-                datetime.now(timezone.utc).isoformat(),
-            ),
+            params,
         )
-        conn.commit()
+        return
+    for _ in range(3):
+        try:
+            with sqlite3.connect(DB_PATH, timeout=30) as write_conn:
+                write_conn.execute(
+                    """
+                    INSERT INTO scrub_queue_history (mpn, step, status, source, message, created_at_utc)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    params,
+                )
+                write_conn.commit()
+                return
+        except sqlite3.OperationalError as ex:
+            if "locked" not in str(ex).lower():
+                raise
+            time.sleep(0.2)
+    with sqlite3.connect(DB_PATH, timeout=30) as write_conn:
+        write_conn.execute(
+            """
+            INSERT INTO scrub_queue_history (mpn, step, status, source, message, created_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            params,
+        )
+        write_conn.commit()
 
 
 def ensure_base_scraper_tables():
@@ -2127,6 +2153,7 @@ def enqueue_scrub_queue_from_upload(file_obj):
                     step="queue_add",
                     status="pending",
                     message="Added from file upload into scrub_queue.",
+                    conn=conn,
                 )
             else:
                 skipped += 1
