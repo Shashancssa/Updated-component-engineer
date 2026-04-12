@@ -103,6 +103,14 @@ def _extract_price_summary(pricing_rows):
     return ""
 
 
+def normalize_mpn(value):
+    txt = str(value or "").strip()
+    if not txt:
+        return ""
+    txt = txt.strip().strip('"').strip("'").strip()
+    return txt
+
+
 def _is_effectively_empty(value):
     txt = str(value or "").strip()
     if not txt:
@@ -161,7 +169,7 @@ def _read_mpn_list_from_upload(file_obj):
             df = pd.read_excel(file_obj)
         if df.empty:
             return []
-        return df.iloc[:, 0].dropna().astype(str).str.strip().tolist()
+        return [normalize_mpn(x) for x in df.iloc[:, 0].dropna().astype(str).tolist() if normalize_mpn(x)]
     except Exception:
         return []
 
@@ -246,7 +254,7 @@ def import_unified_from_excel(file_obj):
     ]
     with sqlite3.connect(DB_PATH) as conn:
         for _, row in df.iterrows():
-            mpn = _pick_value(row, "mpn")
+            mpn = normalize_mpn(_pick_value(row, "mpn"))
             if not mpn:
                 skipped += 1
                 continue
@@ -1166,7 +1174,7 @@ def _as_text(value):
 
 
 def upsert_unified_part_for_mpn(mpn):
-    mpn = str(mpn).strip()
+    mpn = normalize_mpn(mpn)
     if not mpn:
         return
 
@@ -1234,7 +1242,11 @@ def upsert_unified_part_for_mpn(mpn):
             unified["supplier_part_number"] = unified["supplier_part_number"] or _as_text(p.get("Supplier Part Number", ""))
             unified["description"] = unified["description"] or _as_text(p.get("Description", ""))
             unified["category"] = unified["category"] or _as_text(p.get("Category", ""))
-            unified["lifecycle_status"] = unified["lifecycle_status"] or _as_text(p.get("Lifecycle Status", ""))
+            unified["lifecycle_status"] = unified["lifecycle_status"] or _first_non_empty([
+                p.get("Lifecycle Status", ""),
+                p.get("Part Status", ""),
+                p.get("Product Status", ""),
+            ])
             if not str(unified["lifecycle_status"]).strip():
                 unified["lifecycle_status"] = _extract_attribute_value(attrs, "lifecycle", "part status", "product status", "status")
             unified["rohs"] = unified["rohs"] or _first_non_empty([p.get("ROHS", ""), p.get("RoHS", "")])
@@ -1262,7 +1274,20 @@ def upsert_unified_part_for_mpn(mpn):
             unified["package_details"] = unified["package_details"] or _extract_attribute_value(attrs, "package", "case", "mount")
             unified["operating_temperature"] = unified["operating_temperature"] or _extract_attribute_value(attrs, "operating temperature", "temperature range", "operating temp")
             unified["component_thickness"] = unified["component_thickness"] or _extract_attribute_value(attrs, "component thickness", "thickness", "height")
-            unified["reach"] = unified["reach"] or _extract_attribute_value(attrs, "reach")
+            unified["reach"] = unified["reach"] or _extract_attribute_value(attrs, "reach", "reach compliance", "compliance")
+            if not str(unified["reach"]).strip():
+                reach_candidates = []
+                for a in attrs if isinstance(attrs, list) else []:
+                    if not isinstance(a, dict):
+                        continue
+                    nm = str(a.get("Attribute", "")).strip().lower()
+                    vv = str(a.get("Value", "")).strip()
+                    if not vv:
+                        continue
+                    if "compliance" in nm or "reach" in nm:
+                        reach_candidates.append(vv)
+                if reach_candidates:
+                    unified["reach"] = "; ".join(dict.fromkeys(reach_candidates))
             unified["reflow_soldering_time"] = unified["reflow_soldering_time"] or _extract_attribute_value(attrs, "reflow time", "reflow soldering time", "time at reflow")
             unified["wave_soldering_time"] = unified["wave_soldering_time"] or _extract_attribute_value(attrs, "wave time", "wave soldering time")
             unified["body_mark"] = unified["body_mark"] or _extract_attribute_value(attrs, "body mark", "marking")
@@ -2145,7 +2170,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
             "documents": merged_docs,
         }, " + ".join(sources)
 
-    mpn = str(mpn).strip()
+    mpn = normalize_mpn(mpn)
     if not mpn:
         return {"mpn": "", "source": "", "status": "skipped"}
     payload, source = _merge_payload_for_mpn(mpn)
@@ -2181,7 +2206,7 @@ def enqueue_scrub_queue_from_upload(file_obj):
     now_utc = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         for _, row in df.iterrows():
-            mpn = str(row.get(mpn_col, "")).strip()
+            mpn = normalize_mpn(row.get(mpn_col, ""))
             if not mpn or mpn.lower() == "nan":
                 skipped += 1
                 continue
@@ -2299,6 +2324,29 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
             )
             processed.append({"mpn": mpn, "status": "error", "error": str(ex)})
     return processed
+
+
+def routine_check_db_mpns(limit, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", nexar_id="", nexar_secret="", fill_empty_from_fallback=True):
+    ensure_unified_parts_table()
+    mpns = get_available_db_mpns()
+    if limit and int(limit) > 0:
+        mpns = mpns[: int(limit)]
+    results = []
+    for i, m in enumerate(mpns, start=1):
+        result = fetch_live_into_db_for_mpn(
+            m,
+            mouser_key=mouser_key,
+            digikey_id=digikey_id,
+            digikey_secret=digikey_secret,
+            digikey_scope=digikey_scope,
+            nexar_id=nexar_id,
+            nexar_secret=nexar_secret,
+            priority_order=_rotating_priority_for_index(i - 1, split_mode=False),
+            save_to_cells=True,
+            fill_empty_from_fallback=fill_empty_from_fallback,
+        )
+        results.append(result)
+    return results
 
 # ==========================================
 # 3. INTERFACE
@@ -2527,6 +2575,30 @@ with ui_tabs[1]:
         for m in mpns:
             build_z2_spec_cache_for_mpn(m)
         st.success("Z2 specification cache built (tables: z2_spec_cache, z2_parametric_cache).")
+    st.markdown("---")
+    st.markdown("#### Routine Check (Auto refresh from DB MPN list)")
+    rc1, rc2 = st.columns(2)
+    rc_mouser = rc1.text_input("Routine Mouser API Key (Optional)", value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK), type="password", key="routine_mouser")
+    rc_dk_id = rc1.text_input("Routine Digi-Key Client ID (Optional)", value=os.getenv("DIGIKEY_CLIENT_ID", DIGIKEY_CLIENT_ID_FALLBACK), key="routine_dk_id")
+    rc_dk_secret = rc1.text_input("Routine Digi-Key Client Secret (Optional)", value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK), type="password", key="routine_dk_secret")
+    rc_dk_scope = rc1.text_input("Routine Digi-Key Scope (Optional)", value=os.getenv("DIGIKEY_SCOPE", ""), key="routine_dk_scope")
+    rc_nexar_id = rc2.text_input("Routine Nexar ID (Optional)", value=NEXAR_CLIENT_ID_FALLBACK, key="routine_nexar_id")
+    rc_nexar_secret = rc2.text_input("Routine Nexar Secret (Optional)", value=NEXAR_CLIENT_SECRET_FALLBACK, type="password", key="routine_nexar_secret")
+    rc_fill = rc2.toggle("Routine fallback fill empty fields", value=True, key="routine_fill_empty")
+    rc_limit = st.number_input("Routine MPN limit from DB", min_value=1, max_value=50000, value=200, step=50, key="routine_limit")
+    if st.button("🔄 Run Routine Check Now", key="routine_check_run_btn"):
+        routine_results = routine_check_db_mpns(
+            rc_limit,
+            mouser_key=rc_mouser,
+            digikey_id=rc_dk_id,
+            digikey_secret=rc_dk_secret,
+            digikey_scope=rc_dk_scope,
+            nexar_id=rc_nexar_id,
+            nexar_secret=rc_nexar_secret,
+            fill_empty_from_fallback=rc_fill,
+        )
+        st.success(f"Routine check completed for {len(routine_results)} MPN(s).")
+        st.dataframe(pd.DataFrame(routine_results), width="stretch")
     show_footer()
 
 with ui_tabs[2]:
