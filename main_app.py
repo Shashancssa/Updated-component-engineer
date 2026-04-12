@@ -2060,10 +2060,8 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                 except Exception:
                     pass
 
-            # Speed optimization: stop calling next providers once current coverage is already strong.
-            if _coverage_score(best_part) >= 5:
-                break
-            # Optional fast mode: if fallback fill is disabled, stop after first provider hit.
+            # In fallback mode, continue across providers to maximize field coverage.
+            # Fast-stop only when fallback fill is disabled.
             if payloads and not fill_empty_from_fallback:
                 break
 
@@ -2187,7 +2185,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 digikey_scope=digikey_scope,
                 nexar_id=nexar_id,
                 nexar_secret=nexar_secret,
-                priority_order=_rotating_priority_for_index(i - 1, split_mode=True),
+                priority_order=_rotating_priority_for_index(i - 1, split_mode=False),
                 save_to_cells=True,
                 fill_empty_from_fallback=fill_empty_from_fallback,
             )
@@ -2318,7 +2316,7 @@ with ui_tabs[0]:
     live_mouser = lc2.text_input("Mouser API Key (Optional)", value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK), type="password", key="live_combo_mouser")
     live_nexar_id = lc2.text_input("Octopart/Nexar Client ID (Optional)", value=NEXAR_CLIENT_ID_FALLBACK, key="live_combo_nexar_id")
     live_nexar_secret = lc2.text_input("Octopart/Nexar Client Secret (Optional)", value=NEXAR_CLIENT_SECRET_FALLBACK, type="password", key="live_combo_nexar_secret")
-    live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Octopart → Mouser)", value=True, key="live_combo_split_mode")
+    live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Octopart → Mouser)", value=False, key="live_combo_split_mode")
     live_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="live_combo_fill_empty")
     if st.button("Start Live Combo Scraper", key="live_combo_run"):
         live_mpns = []
@@ -2515,7 +2513,7 @@ with ui_tabs[2]:
             type="password",
             key="pending_nexar_secret",
         )
-        pending_split_mode = st.toggle("Fast split mode (Round-robin first hit: Mouser → Digi-Key → Octopart)", value=True, key="pending_split_mode")
+        pending_split_mode = st.toggle("Fast split mode (Round-robin first hit: Mouser → Digi-Key → Octopart)", value=False, key="pending_split_mode")
         pending_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="pending_fill_empty")
         st.write("Pending MPNs:", st.session_state.get("pending_mpns", []))
         if st.button("▶ Fetch Pending MPNs (Digi-Key → Mouser → Octopart)", key="fetch_pending_mpns"):
@@ -2662,6 +2660,9 @@ with ui_tabs[3]:
                     conn,
                     params=mpn_list,
                 )
+            found_mpns = set([str(x).strip().upper() for x in udf.get("mpn", []).tolist() if str(x).strip()])
+            requested_mpns = set([str(x).strip().upper() for x in mpn_list if str(x).strip()])
+            missing_mpns = sorted(requested_mpns - found_mpns)
 
             rename_map = {
                 "manufacturer_part_number": "Manufacture part number",
@@ -2713,6 +2714,10 @@ with ui_tabs[3]:
             export_df = export_df[export_cols]
 
             st.success("DB filled and export prepared from available DB values.")
+            st.caption(f"Requested MPNs: {len(mpn_list)} | Found in unified DB: {len(found_mpns)} | Missing: {len(missing_mpns)}")
+            if missing_mpns:
+                st.warning("Some requested MPNs are missing from unified DB. See list below.")
+                st.dataframe(pd.DataFrame({"missing_mpn": missing_mpns}), width="stretch", hide_index=True)
             if one_mpn_view.strip():
                 one = export_df[export_df["mpn"].astype(str).str.strip().str.upper() == one_mpn_view.strip().upper()]
                 st.markdown("#### One MPN Detail View")
