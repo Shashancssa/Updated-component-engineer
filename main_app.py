@@ -1254,6 +1254,31 @@ def upsert_unified_part_for_mpn(mpn):
             unified["reflow_soldering_time"] = unified["reflow_soldering_time"] or _as_text(p.get("REFLOW SOLDERING TIME", ""))
             unified["wave_soldering_time"] = unified["wave_soldering_time"] or _as_text(p.get("WAVE SOLDERING TIME", ""))
             unified["body_mark"] = unified["body_mark"] or _as_text(p.get("BODY MARK", ""))
+            unified["msd_level"] = unified["msd_level"] or _extract_attribute_value(attrs, "msl", "msd", "moisture sensitivity")
+            unified["reflow_soldering_temperature"] = unified["reflow_soldering_temperature"] or _extract_attribute_value(attrs, "reflow temperature", "reflow soldering temperature", "reflow")
+            unified["thermal_cycle"] = unified["thermal_cycle"] or _extract_attribute_value(attrs, "thermal cycle", "reflow cycle", "number of reflow")
+            unified["wave_soldering_temperature"] = unified["wave_soldering_temperature"] or _extract_attribute_value(attrs, "wave soldering temperature", "wave solder")
+            unified["lsl_details"] = unified["lsl_details"] or _extract_attribute_value(attrs, "lsl", "lead surface", "land side")
+            unified["package_details"] = unified["package_details"] or _extract_attribute_value(attrs, "package", "case", "mount")
+            unified["operating_temperature"] = unified["operating_temperature"] or _extract_attribute_value(attrs, "operating temperature", "temperature range", "operating temp")
+            unified["component_thickness"] = unified["component_thickness"] or _extract_attribute_value(attrs, "component thickness", "thickness", "height")
+            unified["reach"] = unified["reach"] or _extract_attribute_value(attrs, "reach")
+            unified["reflow_soldering_time"] = unified["reflow_soldering_time"] or _extract_attribute_value(attrs, "reflow time", "reflow soldering time", "time at reflow")
+            unified["wave_soldering_time"] = unified["wave_soldering_time"] or _extract_attribute_value(attrs, "wave time", "wave soldering time")
+            unified["body_mark"] = unified["body_mark"] or _extract_attribute_value(attrs, "body mark", "marking")
+            unified["rohs"] = unified["rohs"] or _extract_attribute_value(attrs, "rohs", "rohs status")
+            pricing_rows = payload.get("pricing", []) if isinstance(payload, dict) else []
+            unified["price_details"] = unified["price_details"] or _extract_price_summary(pricing_rows)
+            if not str(unified["datasheet_url"]).strip():
+                docs = payload.get("documents", []) if isinstance(payload, dict) else []
+                if isinstance(docs, list):
+                    for d in docs:
+                        if not isinstance(d, dict):
+                            continue
+                        if "datasheet" in str(d.get("Type", "")).strip().lower():
+                            unified["datasheet_url"] = _as_text(d.get("URL", ""))
+                            if unified["datasheet_url"]:
+                                break
             used_sources.append(source)
 
         scraper_map = {}
@@ -1939,6 +1964,7 @@ def save_live_payload_to_cells(mpn, payload, section_name="Live Combo", title="D
         part = payload["parts"][0]
     if not part:
         return
+    attributes = payload.get("attributes", []) if isinstance(payload.get("attributes"), list) else []
     preferred_rows = [
         ("Manufacturer", part.get("Manufacturer", "")),
         ("Manufacturer Part Number", part.get("Manufacturer Part Number", "")),
@@ -1961,8 +1987,16 @@ def save_live_payload_to_cells(mpn, payload, section_name="Live Combo", title="D
             (mpn, section_name, title),
         )
         conn.execute(
+            "DELETE FROM cells WHERE table_id IN (SELECT id FROM tables WHERE mpn = ? AND section_name = ? AND title = ?)",
+            (mpn, "Live Parametric", "Merged Attributes"),
+        )
+        conn.execute(
             "DELETE FROM tables WHERE mpn = ? AND section_name = ? AND title = ?",
             (mpn, section_name, title),
+        )
+        conn.execute(
+            "DELETE FROM tables WHERE mpn = ? AND section_name = ? AND title = ?",
+            (mpn, "Live Parametric", "Merged Attributes"),
         )
         next_idx = conn.execute(
             "SELECT COALESCE(MAX(table_index), 0) + 1 FROM tables WHERE mpn = ? AND section_name = ?",
@@ -1981,6 +2015,29 @@ def save_live_payload_to_cells(mpn, payload, section_name="Live Combo", title="D
                     (table_id, row_idx, 0, str(header), str(value)),
                 )
                 row_idx += 1
+        if attributes:
+            p_idx = conn.execute(
+                "SELECT COALESCE(MAX(table_index), 0) + 1 FROM tables WHERE mpn = ? AND section_name = ?",
+                (mpn, "Live Parametric"),
+            ).fetchone()[0]
+            p_cur = conn.execute(
+                "INSERT INTO tables (mpn, section_name, title, table_index) VALUES (?, ?, ?, ?)",
+                (mpn, "Live Parametric", "Merged Attributes", int(p_idx)),
+            )
+            p_table_id = p_cur.lastrowid
+            p_row_idx = 0
+            for one in attributes:
+                if not isinstance(one, dict):
+                    continue
+                hdr = str(one.get("Attribute", "")).strip()
+                val = str(one.get("Value", "")).strip()
+                if not hdr or not val:
+                    continue
+                conn.execute(
+                    "INSERT INTO cells (table_id, row_index, col_index, header, value) VALUES (?, ?, ?, ?, ?)",
+                    (p_table_id, p_row_idx, 0, hdr, val),
+                )
+                p_row_idx += 1
         conn.commit()
 
 
