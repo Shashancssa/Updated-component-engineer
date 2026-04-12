@@ -122,6 +122,19 @@ def main():
     )
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS scrub_queue_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mpn TEXT NOT NULL,
+            step TEXT NOT NULL,
+            status TEXT NOT NULL,
+            source TEXT,
+            message TEXT,
+            created_at_utc TEXT NOT NULL
+        );
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS z2_spec_cache (
             mpn TEXT PRIMARY KEY,
             description TEXT,

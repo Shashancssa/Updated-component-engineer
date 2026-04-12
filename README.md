@@ -40,6 +40,7 @@ Reference files:
 - Click **Run next batch** to process in chunks (e.g., 200/500/1000).  
 - The app stores queue status and checkpoint (`last processed MPN`) in DB, so after restart you can continue from remaining pending rows.
 - Use **Live Queue Viewer** to monitor current progress and latest processed rows.
+- Use **Process History (step-wise)** to review every queue event (`queue_add`, `process_start`, `fetch_warning`, `process_done`, `process_error`) and export it as CSV for debugging.
 
 ## Manual data entry
 
