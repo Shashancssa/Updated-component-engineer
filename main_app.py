@@ -265,7 +265,7 @@ def import_unified_from_excel(file_obj):
                 """
                 INSERT OR REPLACE INTO unified_part_cache
                 (mpn, manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, component_thickness, reach, reflow_soldering_time, wave_soldering_time, body_mark, source_trace, updated_at_utc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     merged["mpn"], merged["manufacturer"], merged["manufacturer_part_number"], merged["supplier_part_number"],
@@ -1005,7 +1005,68 @@ def ensure_scrub_queue_tables():
             """,
             (datetime.now(timezone.utc).isoformat(),),
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scrub_queue_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mpn TEXT NOT NULL,
+                step TEXT NOT NULL,
+                status TEXT NOT NULL,
+                source TEXT,
+                message TEXT,
+                created_at_utc TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
+
+
+def log_scrub_history(mpn, step, status, message="", source="", conn=None):
+    mpn = str(mpn or "").strip()
+    if not mpn:
+        return
+    params = (
+        mpn,
+        str(step or "").strip() or "unknown",
+        str(status or "").strip() or "info",
+        str(source or "").strip(),
+        str(message or "").strip(),
+        datetime.now(timezone.utc).isoformat(),
+    )
+    if conn is not None:
+        conn.execute(
+            """
+            INSERT INTO scrub_queue_history (mpn, step, status, source, message, created_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            params,
+        )
+        return
+    for _ in range(3):
+        try:
+            with sqlite3.connect(DB_PATH, timeout=30) as write_conn:
+                write_conn.execute(
+                    """
+                    INSERT INTO scrub_queue_history (mpn, step, status, source, message, created_at_utc)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    params,
+                )
+                write_conn.commit()
+                return
+        except sqlite3.OperationalError as ex:
+            if "locked" not in str(ex).lower():
+                raise
+            time.sleep(0.2)
+    with sqlite3.connect(DB_PATH, timeout=30) as write_conn:
+        write_conn.execute(
+            """
+            INSERT INTO scrub_queue_history (mpn, step, status, source, message, created_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            params,
+        )
+        write_conn.commit()
 
 
 def ensure_base_scraper_tables():
@@ -1267,7 +1328,7 @@ def upsert_unified_part_for_mpn(mpn):
             """
             INSERT OR REPLACE INTO unified_part_cache
             (mpn, manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, component_thickness, reach, reflow_soldering_time, wave_soldering_time, body_mark, source_trace, updated_at_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 unified["mpn"], unified["manufacturer"], unified["manufacturer_part_number"], unified["supplier_part_number"],
@@ -1999,10 +2060,8 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                 except Exception:
                     pass
 
-            # Speed optimization: stop calling next providers once current coverage is already strong.
-            if _coverage_score(best_part) >= 5:
-                break
-            # Optional fast mode: if fallback fill is disabled, stop after first provider hit.
+            # In fallback mode, continue across providers to maximize field coverage.
+            # Fast-stop only when fallback fill is disabled.
             if payloads and not fill_empty_from_fallback:
                 break
 
@@ -2087,6 +2146,13 @@ def enqueue_scrub_queue_from_upload(file_obj):
                 )
             if getattr(cur, "rowcount", 0) == 1:
                 queued += 1
+                log_scrub_history(
+                    mpn,
+                    step="queue_add",
+                    status="pending",
+                    message="Added from file upload into scrub_queue.",
+                    conn=conn,
+                )
             else:
                 skipped += 1
         conn.commit()
@@ -2109,6 +2175,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, mpn))
             conn.commit()
+        log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Batch item {i}/{len(mpns)} started.")
         try:
             result = fetch_live_into_db_for_mpn(
                 mpn,
@@ -2118,15 +2185,26 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 digikey_scope=digikey_scope,
                 nexar_id=nexar_id,
                 nexar_secret=nexar_secret,
-                priority_order=_rotating_priority_for_index(i - 1, split_mode=True),
+                priority_order=_rotating_priority_for_index(i - 1, split_mode=False),
                 save_to_cells=True,
                 fill_empty_from_fallback=fill_empty_from_fallback,
             )
             source = str(result.get("source", "")).strip()
+            save_status = str(result.get("status", "")).strip()
+            if save_status not in ("saved", "unified_only"):
+                raise RuntimeError(f"No DB save completed (status={save_status or 'unknown'}).")
+            if save_status == "unified_only":
+                log_scrub_history(
+                    mpn,
+                    step="fetch_warning",
+                    status="warning",
+                    source=source,
+                    message="No live payload found; only unified cache was refreshed.",
+                )
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
                     "UPDATE scrub_queue SET status='done', source=?, last_error='', updated_at_utc=? WHERE mpn=?",
-                    (source, datetime.now(timezone.utc).isoformat(), mpn),
+                    (source or save_status, datetime.now(timezone.utc).isoformat(), mpn),
                 )
                 conn.execute(
                     """
@@ -2137,7 +2215,14 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                     (mpn, datetime.now(timezone.utc).isoformat()),
                 )
                 conn.commit()
-            processed.append({"mpn": mpn, "status": "done", "source": source})
+            log_scrub_history(
+                mpn,
+                step="process_done",
+                status="done",
+                source=source or save_status,
+                message="Queue item completed and status updated to done.",
+            )
+            processed.append({"mpn": mpn, "status": "done", "source": source or save_status, "result": save_status})
         except Exception as ex:
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
@@ -2149,6 +2234,12 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                     (mpn, datetime.now(timezone.utc).isoformat()),
                 )
                 conn.commit()
+            log_scrub_history(
+                mpn,
+                step="process_error",
+                status="error",
+                message=str(ex),
+            )
             processed.append({"mpn": mpn, "status": "error", "error": str(ex)})
     return processed
 
@@ -2225,7 +2316,7 @@ with ui_tabs[0]:
     live_mouser = lc2.text_input("Mouser API Key (Optional)", value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK), type="password", key="live_combo_mouser")
     live_nexar_id = lc2.text_input("Octopart/Nexar Client ID (Optional)", value=NEXAR_CLIENT_ID_FALLBACK, key="live_combo_nexar_id")
     live_nexar_secret = lc2.text_input("Octopart/Nexar Client Secret (Optional)", value=NEXAR_CLIENT_SECRET_FALLBACK, type="password", key="live_combo_nexar_secret")
-    live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Octopart → Mouser)", value=True, key="live_combo_split_mode")
+    live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Octopart → Mouser)", value=False, key="live_combo_split_mode")
     live_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="live_combo_fill_empty")
     if st.button("Start Live Combo Scraper", key="live_combo_run"):
         live_mpns = []
@@ -2322,6 +2413,10 @@ with ui_tabs[0]:
         qstats = pd.read_sql("SELECT status, COUNT(1) AS cnt FROM scrub_queue GROUP BY status ORDER BY status", conn)
         qstate = pd.read_sql("SELECT * FROM scrub_queue_state WHERE id=1", conn)
         qlive = pd.read_sql("SELECT mpn, manufacturer, status, source, updated_at_utc, last_error FROM scrub_queue ORDER BY updated_at_utc DESC LIMIT 20", conn)
+        qhist = pd.read_sql(
+            "SELECT mpn, step, status, source, message, created_at_utc FROM scrub_queue_history ORDER BY id DESC LIMIT 200",
+            conn,
+        )
     st.markdown("#### Queue Status")
     if not qstats.empty:
         st.dataframe(qstats, width="stretch", hide_index=True)
@@ -2336,6 +2431,28 @@ with ui_tabs[0]:
         st.caption("Queue is empty.")
     else:
         st.dataframe(qlive, width="stretch", hide_index=True)
+    st.markdown("#### Process History (step-wise)")
+    h1, h2 = st.columns([2, 1])
+    hist_filter_mpn = h1.text_input("Filter history by MPN (optional)", key="queue_history_filter_mpn")
+    hist_limit = int(h2.number_input("History rows", min_value=20, max_value=1000, value=200, step=20, key="queue_history_limit"))
+    if not qhist.empty:
+        qhist_show = qhist.copy()
+        if hist_filter_mpn.strip():
+            qhist_show = qhist_show[qhist_show["mpn"].astype(str).str.upper() == hist_filter_mpn.strip().upper()]
+        qhist_show = qhist_show.head(hist_limit)
+        if qhist_show.empty:
+            st.caption("No history rows for this MPN filter.")
+        else:
+            st.dataframe(qhist_show, width="stretch", hide_index=True)
+            st.download_button(
+                "⬇️ Download Process History CSV",
+                data=qhist_show.to_csv(index=False).encode("utf-8"),
+                file_name="queue_process_history.csv",
+                mime="text/csv",
+                key="queue_history_download_btn",
+            )
+    else:
+        st.caption("No process history recorded yet.")
     show_footer()
 
 with ui_tabs[1]:
@@ -2396,7 +2513,7 @@ with ui_tabs[2]:
             type="password",
             key="pending_nexar_secret",
         )
-        pending_split_mode = st.toggle("Fast split mode (Round-robin first hit: Mouser → Digi-Key → Octopart)", value=True, key="pending_split_mode")
+        pending_split_mode = st.toggle("Fast split mode (Round-robin first hit: Mouser → Digi-Key → Octopart)", value=False, key="pending_split_mode")
         pending_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="pending_fill_empty")
         st.write("Pending MPNs:", st.session_state.get("pending_mpns", []))
         if st.button("▶ Fetch Pending MPNs (Digi-Key → Mouser → Octopart)", key="fetch_pending_mpns"):
@@ -2543,6 +2660,9 @@ with ui_tabs[3]:
                     conn,
                     params=mpn_list,
                 )
+            found_mpns = set([str(x).strip().upper() for x in udf.get("mpn", []).tolist() if str(x).strip()])
+            requested_mpns = set([str(x).strip().upper() for x in mpn_list if str(x).strip()])
+            missing_mpns = sorted(requested_mpns - found_mpns)
 
             rename_map = {
                 "manufacturer_part_number": "Manufacture part number",
@@ -2594,6 +2714,10 @@ with ui_tabs[3]:
             export_df = export_df[export_cols]
 
             st.success("DB filled and export prepared from available DB values.")
+            st.caption(f"Requested MPNs: {len(mpn_list)} | Found in unified DB: {len(found_mpns)} | Missing: {len(missing_mpns)}")
+            if missing_mpns:
+                st.warning("Some requested MPNs are missing from unified DB. See list below.")
+                st.dataframe(pd.DataFrame({"missing_mpn": missing_mpns}), width="stretch", hide_index=True)
             if one_mpn_view.strip():
                 one = export_df[export_df["mpn"].astype(str).str.strip().str.upper() == one_mpn_view.strip().upper()]
                 st.markdown("#### One MPN Detail View")
