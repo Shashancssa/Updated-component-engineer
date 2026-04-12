@@ -265,7 +265,7 @@ def import_unified_from_excel(file_obj):
                 """
                 INSERT OR REPLACE INTO unified_part_cache
                 (mpn, manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, component_thickness, reach, reflow_soldering_time, wave_soldering_time, body_mark, source_trace, updated_at_utc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     merged["mpn"], merged["manufacturer"], merged["manufacturer_part_number"], merged["supplier_part_number"],
@@ -1005,6 +1005,41 @@ def ensure_scrub_queue_tables():
             """,
             (datetime.now(timezone.utc).isoformat(),),
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scrub_queue_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mpn TEXT NOT NULL,
+                step TEXT NOT NULL,
+                status TEXT NOT NULL,
+                source TEXT,
+                message TEXT,
+                created_at_utc TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def log_scrub_history(mpn, step, status, message="", source=""):
+    mpn = str(mpn or "").strip()
+    if not mpn:
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO scrub_queue_history (mpn, step, status, source, message, created_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                mpn,
+                str(step or "").strip() or "unknown",
+                str(status or "").strip() or "info",
+                str(source or "").strip(),
+                str(message or "").strip(),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
         conn.commit()
 
 
@@ -1267,7 +1302,7 @@ def upsert_unified_part_for_mpn(mpn):
             """
             INSERT OR REPLACE INTO unified_part_cache
             (mpn, manufacturer, manufacturer_part_number, supplier_part_number, description, category, lifecycle_status, rohs, stock, datasheet_url, product_url, msd_level, reflow_soldering_temperature, thermal_cycle, wave_soldering_temperature, lsl_details, package_details, price_details, operating_temperature, component_thickness, reach, reflow_soldering_time, wave_soldering_time, body_mark, source_trace, updated_at_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 unified["mpn"], unified["manufacturer"], unified["manufacturer_part_number"], unified["supplier_part_number"],
@@ -2087,6 +2122,12 @@ def enqueue_scrub_queue_from_upload(file_obj):
                 )
             if getattr(cur, "rowcount", 0) == 1:
                 queued += 1
+                log_scrub_history(
+                    mpn,
+                    step="queue_add",
+                    status="pending",
+                    message="Added from file upload into scrub_queue.",
+                )
             else:
                 skipped += 1
         conn.commit()
@@ -2109,6 +2150,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, mpn))
             conn.commit()
+        log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Batch item {i}/{len(mpns)} started.")
         try:
             result = fetch_live_into_db_for_mpn(
                 mpn,
@@ -2123,10 +2165,21 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 fill_empty_from_fallback=fill_empty_from_fallback,
             )
             source = str(result.get("source", "")).strip()
+            save_status = str(result.get("status", "")).strip()
+            if save_status not in ("saved", "unified_only"):
+                raise RuntimeError(f"No DB save completed (status={save_status or 'unknown'}).")
+            if save_status == "unified_only":
+                log_scrub_history(
+                    mpn,
+                    step="fetch_warning",
+                    status="warning",
+                    source=source,
+                    message="No live payload found; only unified cache was refreshed.",
+                )
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
                     "UPDATE scrub_queue SET status='done', source=?, last_error='', updated_at_utc=? WHERE mpn=?",
-                    (source, datetime.now(timezone.utc).isoformat(), mpn),
+                    (source or save_status, datetime.now(timezone.utc).isoformat(), mpn),
                 )
                 conn.execute(
                     """
@@ -2137,7 +2190,14 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                     (mpn, datetime.now(timezone.utc).isoformat()),
                 )
                 conn.commit()
-            processed.append({"mpn": mpn, "status": "done", "source": source})
+            log_scrub_history(
+                mpn,
+                step="process_done",
+                status="done",
+                source=source or save_status,
+                message="Queue item completed and status updated to done.",
+            )
+            processed.append({"mpn": mpn, "status": "done", "source": source or save_status, "result": save_status})
         except Exception as ex:
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
@@ -2149,6 +2209,12 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                     (mpn, datetime.now(timezone.utc).isoformat()),
                 )
                 conn.commit()
+            log_scrub_history(
+                mpn,
+                step="process_error",
+                status="error",
+                message=str(ex),
+            )
             processed.append({"mpn": mpn, "status": "error", "error": str(ex)})
     return processed
 
@@ -2322,6 +2388,10 @@ with ui_tabs[0]:
         qstats = pd.read_sql("SELECT status, COUNT(1) AS cnt FROM scrub_queue GROUP BY status ORDER BY status", conn)
         qstate = pd.read_sql("SELECT * FROM scrub_queue_state WHERE id=1", conn)
         qlive = pd.read_sql("SELECT mpn, manufacturer, status, source, updated_at_utc, last_error FROM scrub_queue ORDER BY updated_at_utc DESC LIMIT 20", conn)
+        qhist = pd.read_sql(
+            "SELECT mpn, step, status, source, message, created_at_utc FROM scrub_queue_history ORDER BY id DESC LIMIT 200",
+            conn,
+        )
     st.markdown("#### Queue Status")
     if not qstats.empty:
         st.dataframe(qstats, width="stretch", hide_index=True)
@@ -2336,6 +2406,28 @@ with ui_tabs[0]:
         st.caption("Queue is empty.")
     else:
         st.dataframe(qlive, width="stretch", hide_index=True)
+    st.markdown("#### Process History (step-wise)")
+    h1, h2 = st.columns([2, 1])
+    hist_filter_mpn = h1.text_input("Filter history by MPN (optional)", key="queue_history_filter_mpn")
+    hist_limit = int(h2.number_input("History rows", min_value=20, max_value=1000, value=200, step=20, key="queue_history_limit"))
+    if not qhist.empty:
+        qhist_show = qhist.copy()
+        if hist_filter_mpn.strip():
+            qhist_show = qhist_show[qhist_show["mpn"].astype(str).str.upper() == hist_filter_mpn.strip().upper()]
+        qhist_show = qhist_show.head(hist_limit)
+        if qhist_show.empty:
+            st.caption("No history rows for this MPN filter.")
+        else:
+            st.dataframe(qhist_show, width="stretch", hide_index=True)
+            st.download_button(
+                "⬇️ Download Process History CSV",
+                data=qhist_show.to_csv(index=False).encode("utf-8"),
+                file_name="queue_process_history.csv",
+                mime="text/csv",
+                key="queue_history_download_btn",
+            )
+    else:
+        st.caption("No process history recorded yet.")
     show_footer()
 
 with ui_tabs[1]:
