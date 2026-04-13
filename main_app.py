@@ -2123,6 +2123,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
 
         payloads = []
         sources = []
+        provider_errors = []
         provider_order = priority_order or ["digikey", "octopart", "mouser"]
         best_part = {}
         for provider in provider_order:
@@ -2143,7 +2144,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                         if isinstance(pb["parts"][0], dict) and _coverage_score(pb["parts"][0]) > _coverage_score(best_part):
                             best_part = pb["parts"][0]
                 except Exception:
-                    pass
+                    provider_errors.append(f"{SOURCE_DIGIKEY}: fetch failed")
             elif p == "mouser" and mouser_key.strip():
                 try:
                     pa = fetch_mouser_part_data(one_mpn, mouser_key.strip())
@@ -2153,7 +2154,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                         if isinstance(pa["parts"][0], dict) and _coverage_score(pa["parts"][0]) > _coverage_score(best_part):
                             best_part = pa["parts"][0]
                 except Exception:
-                    pass
+                    provider_errors.append(f"{SOURCE_MOUSER}: fetch failed")
             elif p in {"nexar", "octopart"} and nexar_id.strip() and nexar_secret.strip():
                 try:
                     pn = fetch_nexar_part_data(
@@ -2167,7 +2168,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                         if isinstance(pn["parts"][0], dict) and _coverage_score(pn["parts"][0]) > _coverage_score(best_part):
                             best_part = pn["parts"][0]
                 except Exception:
-                    pass
+                    provider_errors.append(f"{SOURCE_NEXAR}: fetch failed")
 
             # In fallback mode, continue across providers to maximize field coverage.
             # Fast-stop only when fallback fill is disabled.
@@ -2175,7 +2176,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                 break
 
         if not payloads:
-            return None, ""
+            return None, "; ".join(provider_errors[:3])
 
         merged_part = {}
         merged_pricing, merged_attrs, merged_docs = [], [], []
@@ -2557,19 +2558,6 @@ with ui_tabs[0]:
     q_col1.metric("✅ Done", done_count)
     q_col2.metric("🔄 In Progress", in_progress_count)
     q_col3.metric("🕒 Pending", pending_count)
-    auto_queue_refresh = st.toggle("Auto-refresh queue monitor", value=True, key="queue_auto_refresh_toggle")
-    refresh_seconds = int(st.number_input("Queue refresh seconds", min_value=3, max_value=60, value=8, step=1, key="queue_refresh_seconds"))
-    if auto_queue_refresh:
-        components.html(
-            f"""
-            <script>
-                setTimeout(function() {{
-                    window.parent.location.reload();
-                }}, {refresh_seconds * 1000});
-            </script>
-            """,
-            height=0,
-        )
     if not qstats.empty:
         st.dataframe(qstats, width="stretch", hide_index=True)
     if not qstate.empty:
