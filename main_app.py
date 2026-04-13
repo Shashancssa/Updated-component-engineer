@@ -140,6 +140,23 @@ def normalize_mpn(value):
     return txt
 
 
+def build_mpn_search_candidates(value):
+    raw = normalize_mpn(value)
+    if not raw:
+        return []
+    candidates = [raw]
+    no_dash = raw.replace("-", "")
+    if no_dash and no_dash not in candidates:
+        candidates.append(no_dash)
+    alnum = re.sub(r"[^A-Za-z0-9]", "", raw)
+    if alnum and alnum not in candidates:
+        candidates.append(alnum)
+    lz = raw.lstrip("0")
+    if lz and lz not in candidates:
+        candidates.append(lz)
+    return candidates
+
+
 def _is_effectively_empty(value):
     txt = str(value or "").strip()
     if not txt:
@@ -2225,16 +2242,40 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
         def _build_provider_task(provider_key):
             p = str(provider_key).strip().lower()
             if p == "digikey" and digikey_id.strip() and digikey_secret.strip():
-                return lambda: fetch_digikey_part_data(
-                    one_mpn,
-                    client_id=digikey_id.strip(),
-                    client_secret=digikey_secret.strip(),
-                    scope=digikey_scope.strip() or None,
-                    site="US",
-                    currency="USD",
-                )
+                def _digikey_task():
+                    for cand in build_mpn_search_candidates(one_mpn):
+                        out = fetch_digikey_part_data(
+                            cand,
+                            client_id=digikey_id.strip(),
+                            client_secret=digikey_secret.strip(),
+                            scope=digikey_scope.strip() or None,
+                            site="US",
+                            currency="USD",
+                        )
+                        if out and out.get("parts"):
+                            for key in ["parts", "pricing", "attributes", "documents"]:
+                                rows = out.get(key, [])
+                                if isinstance(rows, list):
+                                    for row in rows:
+                                        if isinstance(row, dict) and "Requested MPN" in row:
+                                            row["Requested MPN"] = one_mpn
+                            return out
+                    return {"parts": [], "pricing": [], "attributes": [], "documents": []}
+                return _digikey_task
             if p == "mouser" and mouser_key.strip():
-                return lambda: fetch_mouser_part_data(one_mpn, mouser_key.strip())
+                def _mouser_task():
+                    for cand in build_mpn_search_candidates(one_mpn):
+                        out = fetch_mouser_part_data(cand, mouser_key.strip())
+                        if out and out.get("parts"):
+                            for key in ["parts", "pricing", "attributes", "documents"]:
+                                rows = out.get(key, [])
+                                if isinstance(rows, list):
+                                    for row in rows:
+                                        if isinstance(row, dict) and "Requested MPN" in row:
+                                            row["Requested MPN"] = one_mpn
+                            return out
+                    return {"parts": [], "pricing": [], "attributes": [], "documents": []}
+                return _mouser_task
             return None
 
         provider_tasks = {}
