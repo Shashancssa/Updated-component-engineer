@@ -2667,10 +2667,10 @@ with ui_tabs[2]:
             type="password",
             key="pending_nexar_secret",
         )
-        pending_split_mode = st.toggle("Fast split mode (Round-robin first hit: Mouser → Digi-Key → Octopart)", value=False, key="pending_split_mode")
+        pending_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Octopart → Mouser)", value=False, key="pending_split_mode")
         pending_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="pending_fill_empty")
         st.write("Pending MPNs:", st.session_state.get("pending_mpns", []))
-        if st.button("▶ Fetch Pending MPNs (Digi-Key → Mouser → Octopart)", key="fetch_pending_mpns"):
+        if st.button("▶ Fetch Pending MPNs (Digi-Key → Octopart → Mouser)", key="fetch_pending_mpns"):
             pending = st.session_state.get("pending_mpns", [])
             if not pending:
                 st.info("Pending list is empty.")
