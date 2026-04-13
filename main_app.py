@@ -523,6 +523,36 @@ def fetch_digikey_part_data(
     timeout=30,
     scope=None,
 ):
+    def _norm_mpn(value):
+        return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+    def _pick_best_digikey_product(products, requested_mpn):
+        if not isinstance(products, list):
+            return {}
+        req_norm = _norm_mpn(requested_mpn)
+        best = {}
+        best_score = -1
+        for prod in products:
+            if not isinstance(prod, dict):
+                continue
+            mfr_norm = _norm_mpn(prod.get("ManufacturerPartNumber", ""))
+            dk_norm = _norm_mpn(prod.get("DigiKeyPartNumber", ""))
+            score = 0
+            if req_norm and mfr_norm == req_norm:
+                score = 100
+            elif req_norm and req_norm in mfr_norm:
+                score = 80
+            elif req_norm and dk_norm == req_norm:
+                score = 60
+            elif req_norm and req_norm in dk_norm:
+                score = 40
+            elif mfr_norm:
+                score = 10
+            if score > best_score:
+                best = prod
+                best_score = score
+        return best if isinstance(best, dict) else {}
+
     try:
         token = get_digikey_access_token(
             client_id,
@@ -597,8 +627,9 @@ def fetch_digikey_part_data(
             with request.urlopen(keyword_req, timeout=timeout) as resp:
                 key_data = json.loads(resp.read().decode("utf-8") or "{}")
             products = key_data.get("Products", []) if isinstance(key_data, dict) else []
-            if products and isinstance(products[0], dict):
-                product = products[0]
+            picked = _pick_best_digikey_product(products, part_number)
+            if picked:
+                product = picked
                 break
         except HTTPError as e:
             detail = ""
@@ -646,10 +677,15 @@ def fetch_digikey_part_data(
     parameters = product.get("Parameters") if isinstance(product.get("Parameters"), list) else []
     lifecycle_status = _digikey_lifecycle(product, parameters)
 
+    manufacturer_pn = _dk_text(product.get("ManufacturerPartNumber", ""))
+    digikey_pn = _dk_text(product.get("DigiKeyPartNumber", ""))
+    preferred_ref = manufacturer_pn or digikey_pn
+
     part_row = {
         "Requested MPN": str(part_number).strip(),
-        "Supplier Part Number": _dk_text(product.get("DigiKeyPartNumber", "")),
-        "Manufacturer Part Number": _dk_text(product.get("ManufacturerPartNumber", "")),
+        "Supplier Part Number": preferred_ref,
+        "Manufacturer Part Number": manufacturer_pn,
+        "Digi-Key Part Number": digikey_pn,
         "Manufacturer": _dk_text((product.get("Manufacturer", {}) or {}).get("Name", "") if isinstance(product.get("Manufacturer", {}), dict) else product.get("Manufacturer", "")),
         "Description": _dk_text(product.get("ProductDescription", "") or product.get("Description", "")),
         "Category": _dk_text((product.get("Category", {}) or {}).get("Name", "") if isinstance(product.get("Category", {}), dict) else product.get("Category", "")),
@@ -1517,9 +1553,26 @@ def fetch_digikey_data(mpn, digikey_id, digikey_secret, digikey_scope=None, digi
         with request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8") or "{}")
         products = data.get("Products", []) if isinstance(data, dict) else []
-        if not products or not isinstance(products[0], dict):
+        if not products:
             return safe
-        p0 = products[0]
+        req_norm = re.sub(r"[^A-Z0-9]", "", str(mpn or "").upper())
+        def _score(prod):
+            if not isinstance(prod, dict):
+                return -1
+            mfr_norm = re.sub(r"[^A-Z0-9]", "", str(prod.get("ManufacturerPartNumber", "")).upper())
+            dk_norm = re.sub(r"[^A-Z0-9]", "", str(prod.get("DigiKeyPartNumber", "")).upper())
+            if req_norm and mfr_norm == req_norm:
+                return 100
+            if req_norm and req_norm in mfr_norm:
+                return 80
+            if req_norm and dk_norm == req_norm:
+                return 60
+            if req_norm and req_norm in dk_norm:
+                return 40
+            return 0
+        p0 = max([p for p in products if isinstance(p, dict)], key=_score, default={})
+        if not isinstance(p0, dict) or not p0:
+            return safe
         pricing = p0.get("StandardPricing", [])
         if pricing and isinstance(pricing[0], dict):
             safe["price"] = _to_float_price(pricing[0].get("UnitPrice"))
