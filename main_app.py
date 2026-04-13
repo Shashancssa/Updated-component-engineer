@@ -2357,6 +2357,30 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
     return {"mpn": mpn, "source": source, "status": "saved" if payload is not None else "unified_only"}
 
 
+def process_mpns_concurrently(mpns, worker_fn, max_workers=4):
+    """Run MPN tasks concurrently and preserve input order in output."""
+    ordered = [normalize_mpn(x) for x in (mpns or [])]
+    ordered = [x for x in ordered if x]
+    if not ordered:
+        return []
+    max_workers = max(1, min(int(max_workers or 1), 16, len(ordered)))
+    results_map = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_map = {ex.submit(worker_fn, mpn, idx): (idx, mpn) for idx, mpn in enumerate(ordered)}
+        for fut in as_completed(future_map):
+            idx, mpn = future_map[fut]
+            try:
+                out = fut.result()
+                if isinstance(out, dict):
+                    out.setdefault("mpn", mpn)
+                else:
+                    out = {"mpn": mpn, "status": "done", "result": str(out)}
+            except Exception as exn:
+                out = {"mpn": mpn, "status": "error", "error": str(exn)}
+            results_map[idx] = out
+    return [results_map[i] for i in sorted(results_map.keys())]
+
+
 def enqueue_scrub_queue_from_upload(file_obj):
     if not file_obj:
         return {"queued": 0, "skipped": 0, "error": "No file selected"}
@@ -2414,7 +2438,7 @@ def enqueue_scrub_queue_from_upload(file_obj):
     return {"queued": queued, "skipped": skipped, "error": ""}
 
 
-def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True):
+def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4):
     ensure_scrub_queue_tables()
     batch_size = max(1, int(batch_size or 1))
     now_utc = datetime.now(timezone.utc).isoformat()
@@ -2431,69 +2455,89 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
             conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, mpn))
             conn.commit()
         log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Batch item {i}/{len(mpns)} started.")
-        try:
-            result = fetch_live_into_db_for_mpn(
-                mpn,
-                mouser_key=mouser_key,
-                digikey_id=digikey_id,
-                digikey_secret=digikey_secret,
-                digikey_scope=digikey_scope,
-                priority_order=_rotating_priority_for_index(i - 1, split_mode=False),
-                save_to_cells=True,
-                fill_empty_from_fallback=fill_empty_from_fallback,
-            )
-            source = str(result.get("source", "")).strip()
-            save_status = str(result.get("status", "")).strip()
-            if save_status not in ("saved", "unified_only"):
-                raise RuntimeError(f"No DB save completed (status={save_status or 'unknown'}).")
-            if save_status == "unified_only":
-                log_scrub_history(
-                    mpn,
-                    step="fetch_warning",
-                    status="warning",
-                    source=source,
-                    message="No live payload found; only unified cache was refreshed.",
-                )
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute(
-                    "UPDATE scrub_queue SET status='done', source=?, last_error='', updated_at_utc=? WHERE mpn=?",
-                    (source or save_status, datetime.now(timezone.utc).isoformat(), mpn),
-                )
-                conn.execute(
-                    """
-                    UPDATE scrub_queue_state
-                    SET last_mpn=?, last_status='done', processed_count=processed_count+1, updated_at_utc=?
-                    WHERE id=1
-                    """,
-                    (mpn, datetime.now(timezone.utc).isoformat()),
-                )
-                conn.commit()
-            log_scrub_history(
-                mpn,
-                step="process_done",
-                status="done",
-                source=source or save_status,
-                message="Queue item completed and status updated to done.",
-            )
-            processed.append({"mpn": mpn, "status": "done", "source": source or save_status, "result": save_status})
-        except Exception as ex:
+
+    def _queue_worker(one_mpn, zero_idx):
+        return fetch_live_into_db_for_mpn(
+            one_mpn,
+            mouser_key=mouser_key,
+            digikey_id=digikey_id,
+            digikey_secret=digikey_secret,
+            digikey_scope=digikey_scope,
+            priority_order=_rotating_priority_for_index(zero_idx, split_mode=False),
+            save_to_cells=True,
+            fill_empty_from_fallback=fill_empty_from_fallback,
+        )
+
+    worker_results = process_mpns_concurrently(mpns, _queue_worker, max_workers=max_workers)
+
+    for out in worker_results:
+        mpn = str(out.get("mpn", "")).strip()
+        if not mpn:
+            continue
+        if str(out.get("status", "")).strip().lower() == "error":
+            err = str(out.get("error", "Unknown queue error"))
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
                     "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
-                    (str(ex), datetime.now(timezone.utc).isoformat(), mpn),
+                    (err, datetime.now(timezone.utc).isoformat(), mpn),
                 )
                 conn.execute(
                     "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
                     (mpn, datetime.now(timezone.utc).isoformat()),
                 )
                 conn.commit()
+            log_scrub_history(mpn, step="process_error", status="error", message=err)
+            processed.append({"mpn": mpn, "status": "error", "error": err})
+            continue
+
+        source = str(out.get("source", "")).strip()
+        save_status = str(out.get("status", "")).strip()
+        if save_status not in ("saved", "unified_only"):
+            err = f"No DB save completed (status={save_status or 'unknown'})."
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
+                    (err, datetime.now(timezone.utc).isoformat(), mpn),
+                )
+                conn.execute(
+                    "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
+                    (mpn, datetime.now(timezone.utc).isoformat()),
+                )
+                conn.commit()
+            log_scrub_history(mpn, step="process_error", status="error", message=err)
+            processed.append({"mpn": mpn, "status": "error", "error": err})
+            continue
+
+        if save_status == "unified_only":
             log_scrub_history(
                 mpn,
-                step="process_error",
-                status="error",
-                message=str(ex),
+                step="fetch_warning",
+                status="warning",
+                source=source,
+                message="No live payload found; only unified cache was refreshed.",
             )
-            processed.append({"mpn": mpn, "status": "error", "error": str(ex)})
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE scrub_queue SET status='done', source=?, last_error='', updated_at_utc=? WHERE mpn=?",
+                (source or save_status, datetime.now(timezone.utc).isoformat(), mpn),
+            )
+            conn.execute(
+                """
+                UPDATE scrub_queue_state
+                SET last_mpn=?, last_status='done', processed_count=processed_count+1, updated_at_utc=?
+                WHERE id=1
+                """,
+                (mpn, datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+        log_scrub_history(
+            mpn,
+            step="process_done",
+            status="done",
+            source=source or save_status,
+            message="Queue item completed and status updated to done.",
+        )
+        processed.append({"mpn": mpn, "status": "done", "source": source or save_status, "result": save_status})
     return processed
 
 
@@ -2589,6 +2633,8 @@ with ui_tabs[0]:
     live_dk_scope = lc1.text_input("Digi-Key Scope (Optional)", value=os.getenv("DIGIKEY_SCOPE", ""), key="live_combo_dk_scope")
     live_mouser = lc2.text_input("Mouser API Key (Optional)", value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK), type="password", key="live_combo_mouser")
     live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Mouser)", value=False, key="live_combo_split_mode")
+    live_workers = st.number_input("Live combo parallel workers", min_value=1, max_value=16, value=4, step=1, key="live_combo_workers")
+    st.caption("Tip: Use 4-8 workers to target ~30+ MPN/min, based on API/network response time.")
     live_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="live_combo_fill_empty")
     if st.button("Start Live Combo Scraper", key="live_combo_run"):
         live_mpns = []
@@ -2599,26 +2645,26 @@ with ui_tabs[0]:
         if not live_mpns:
             st.error("Please upload or enter at least one MPN.")
         else:
-            bar = st.progress(0)
+            start_ts = time.time()
+            bar = st.progress(15)
             status_txt = st.empty()
-            rows = []
-            for i, m in enumerate(live_mpns, start=1):
-                remaining = len(live_mpns) - i
-                status_txt.info(f"Processing {i}/{len(live_mpns)} | Pending: {remaining}")
-                rows.append(
-                    fetch_live_into_db_for_mpn(
-                        m,
-                        mouser_key=live_mouser,
-                        digikey_id=live_dk_id,
-                        digikey_secret=live_dk_secret,
-                        digikey_scope=live_dk_scope,
-                        priority_order=_rotating_priority_for_index(i - 1, split_mode=live_split_mode),
-                        save_to_cells=True,
-                        fill_empty_from_fallback=live_fill_empty,
-                    )
+            status_txt.info(f"Running {len(live_mpns)} MPNs with {int(live_workers)} parallel workers...")
+            def _live_worker(one_mpn, zero_idx):
+                return fetch_live_into_db_for_mpn(
+                    one_mpn,
+                    mouser_key=live_mouser,
+                    digikey_id=live_dk_id,
+                    digikey_secret=live_dk_secret,
+                    digikey_scope=live_dk_scope,
+                    priority_order=_rotating_priority_for_index(zero_idx, split_mode=live_split_mode),
+                    save_to_cells=True,
+                    fill_empty_from_fallback=live_fill_empty,
                 )
-                bar.progress(i / len(live_mpns))
-            status_txt.success(f"Completed {len(live_mpns)}/{len(live_mpns)} | Pending: 0")
+            rows = process_mpns_concurrently(live_mpns, _live_worker, max_workers=int(live_workers))
+            bar.progress(100)
+            elapsed = max(0.001, time.time() - start_ts)
+            rpm = round((len(rows) / elapsed) * 60, 2)
+            status_txt.success(f"Completed {len(rows)}/{len(live_mpns)} | Throughput: {rpm} MPN/min")
             st.dataframe(pd.DataFrame(rows), width="stretch")
             st.success("Live combo scrape complete and saved to DB cells.")
 
@@ -2631,6 +2677,8 @@ with ui_tabs[0]:
     bg_dk_secret = bgc1.text_input("Queue Digi-Key Client Secret", value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK), type="password", key="bg_dk_secret")
     bg_dk_scope = bgc1.text_input("Queue Digi-Key Scope", value=os.getenv("DIGIKEY_SCOPE", ""), key="bg_dk_scope")
     bg_fill_empty = bgc2.toggle("Queue fallback fill empty fields", value=True, key="bg_fill_empty")
+    bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=16, value=4, step=1, key="bg_workers")
+    queue_auto_loop = bgc2.toggle("Keep processing in background-style loop", value=False, key="bg_auto_loop")
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
 
     bg_file = st.file_uploader("Upload full MPN file (col1=MPN, col2=Manufacturer/Make optional)", type=["xlsx", "csv"], key="bg_queue_upload")
@@ -2651,6 +2699,7 @@ with ui_tabs[0]:
                     digikey_secret=bg_dk_secret,
                     digikey_scope=bg_dk_scope,
                     fill_empty_from_fallback=bg_fill_empty,
+                    max_workers=int(bg_workers),
                 )
                 if processed:
                     st.success(f"Auto-run started immediately and processed {len(processed)} queued rows.")
@@ -2659,19 +2708,32 @@ with ui_tabs[0]:
                     st.info("Auto-run was enabled, but no rows were processed in the first batch.")
 
     if run_batch:
-        processed = process_scrub_queue_batch(
-            int(bg_batch_size),
-            mouser_key=bg_mouser,
-            digikey_id=bg_dk_id,
-            digikey_secret=bg_dk_secret,
-            digikey_scope=bg_dk_scope,
-            fill_empty_from_fallback=bg_fill_empty,
-        )
-        if not processed:
+        all_processed = []
+        round_no = 0
+        start_ts = time.time()
+        while True:
+            round_no += 1
+            processed = process_scrub_queue_batch(
+                int(bg_batch_size),
+                mouser_key=bg_mouser,
+                digikey_id=bg_dk_id,
+                digikey_secret=bg_dk_secret,
+                digikey_scope=bg_dk_scope,
+                fill_empty_from_fallback=bg_fill_empty,
+                max_workers=int(bg_workers),
+            )
+            if not processed:
+                break
+            all_processed.extend(processed)
+            if not queue_auto_loop:
+                break
+        if not all_processed:
             st.info("No pending queue rows. Queue is idle.")
         else:
-            st.success(f"Processed {len(processed)} queue rows in this run.")
-            st.dataframe(pd.DataFrame(processed), width="stretch")
+            elapsed = max(0.001, time.time() - start_ts)
+            rpm = round((len(all_processed) / elapsed) * 60, 2)
+            st.success(f"Processed {len(all_processed)} queue rows across {round_no} run(s) | Throughput: {rpm} MPN/min")
+            st.dataframe(pd.DataFrame(all_processed), width="stretch")
 
     with sqlite3.connect(DB_PATH) as conn:
         qstats = pd.read_sql("SELECT status, COUNT(1) AS cnt FROM scrub_queue GROUP BY status ORDER BY status", conn)
@@ -2959,8 +3021,8 @@ with ui_tabs[3]:
                 "operating_temperature": "OPERATING TEMPERATURE",
                 "component_thickness": "Component thickness",
                 "reach": "Reach",
-                "reflow_soldering_time": "Reflow soldering time",
-                "wave_soldering_time": "Wave soldering time",
+                "reflow_soldering_time": "Reflow solder time",
+                "wave_soldering_time": "Wave solder time",
                 "body_mark": "Body mark",
             }
             export_df = udf.rename(columns=rename_map)
@@ -2982,8 +3044,8 @@ with ui_tabs[3]:
                 "OPERATING TEMPERATURE",
                 "Component thickness",
                 "Reach",
-                "Reflow soldering time",
-                "Wave soldering time",
+                "Reflow solder time",
+                "Wave solder time",
                 "Body mark",
             ]
             for c in export_cols:
@@ -3037,8 +3099,8 @@ with ui_tabs[3]:
         manual_operating = n2.text_input("OPERATING TEMPERATURE")
         manual_component_thickness = n3.text_input("Component thickness")
         manual_reach = n3.text_input("Reach")
-        manual_reflow_time = n3.text_input("Reflow soldering time")
-        manual_wave_time = n3.text_input("Wave soldering time")
+        manual_reflow_time = n3.text_input("Reflow solder time")
+        manual_wave_time = n3.text_input("Wave solder time")
         manual_body_mark = n3.text_input("Body mark")
         manual_source = n3.text_input("Source Trace", value="ManualEntry")
         save_manual = st.form_submit_button("💾 Save Manual Entry")
