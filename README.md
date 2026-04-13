@@ -12,22 +12,32 @@ python init_components_db.py
 
 `components.db` is intentionally not committed as a binary file; generate it locally with the command above.
 
-Use the following column order in Excel/CSV before loading to the database:
+Use the following template header in Excel/CSV before loading to the database (`excel_import_template.csv`):
 
 1. `mpn`
-2. `manufacture_part_number`
-3. `manufacture`
-4. `lifecycle`
+2. `manufacturer`
+3. `manufacturer_part_number`
+4. `supplier_part_number`
 5. `rohs`
 6. `description`
-7. `msd_level`
-8. `datasheet_link`
-9. `reflow_soldering_temperature`
-10. `thermal_cycle`
-11. `wave_soldering_temperature`
-12. `lsl_details`
-13. `package`
-14. `price_details`
+7. `category`
+8. `lifecycle_status`
+9. `stock`
+10. `datasheet_url`
+11. `product_url`
+12. `msd_level`
+13. `reflow_soldering_temperature`
+14. `thermal_cycle`
+15. `wave_soldering_temperature`
+16. `lsl_details`
+17. `package_details`
+18. `price_details`
+19. `operating_temperature`
+20. `component_thickness`
+21. `reach`
+22. `reflow_soldering_time` (Reflow solder time)
+23. `wave_soldering_time` (Wave solder time)
+24. `body_mark`
 
 Reference files:
 - `excel_import_template.csv` → header row to paste into Excel.
@@ -37,7 +47,7 @@ Reference files:
 
 - Use **Large File Background Queue (Resume Supported)** in the Scraper tab.
 - Upload full file (`col1=MPN`, `col2=Manufacturer/Make` optional), then click **Add file to queue**.
-- Click **Run next batch** to process in chunks (e.g., 200/500/1000).  
+- Click **Run queue now (process all)** to drain all pending rows in the queue.  
 - The app stores queue status and checkpoint (`last processed MPN`) in DB, so after restart you can continue from remaining pending rows.
 - Use **Live Queue Viewer** to monitor current progress and latest processed rows.
 - Use **Process History (step-wise)** to review every queue event (`queue_add`, `process_start`, `fetch_warning`, `process_done`, `process_error`) and export it as CSV for debugging.

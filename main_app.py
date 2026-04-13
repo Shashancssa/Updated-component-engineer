@@ -9,6 +9,7 @@ import os
 import json
 import difflib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from datetime import datetime, timezone
 import requests
 from pathlib import Path
@@ -2357,6 +2358,30 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
     return {"mpn": mpn, "source": source, "status": "saved" if payload is not None else "unified_only"}
 
 
+def process_mpns_concurrently(mpns, worker_fn, max_workers=4):
+    """Run MPN tasks concurrently and preserve input order in output."""
+    ordered = [normalize_mpn(x) for x in (mpns or [])]
+    ordered = [x for x in ordered if x]
+    if not ordered:
+        return []
+    max_workers = max(1, min(int(max_workers or 1), 16, len(ordered)))
+    results_map = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_map = {ex.submit(worker_fn, mpn, idx): (idx, mpn) for idx, mpn in enumerate(ordered)}
+        for fut in as_completed(future_map):
+            idx, mpn = future_map[fut]
+            try:
+                out = fut.result()
+                if isinstance(out, dict):
+                    out.setdefault("mpn", mpn)
+                else:
+                    out = {"mpn": mpn, "status": "done", "result": str(out)}
+            except Exception as exn:
+                out = {"mpn": mpn, "status": "error", "error": str(exn)}
+            results_map[idx] = out
+    return [results_map[i] for i in sorted(results_map.keys())]
+
+
 def enqueue_scrub_queue_from_upload(file_obj):
     if not file_obj:
         return {"queued": 0, "skipped": 0, "error": "No file selected"}
@@ -2414,7 +2439,7 @@ def enqueue_scrub_queue_from_upload(file_obj):
     return {"queued": queued, "skipped": skipped, "error": ""}
 
 
-def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True):
+def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4):
     ensure_scrub_queue_tables()
     batch_size = max(1, int(batch_size or 1))
     now_utc = datetime.now(timezone.utc).isoformat()
@@ -2426,13 +2451,16 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
         ).fetchall()
         mpns = [str(r[0]).strip() for r in rows if str(r[0]).strip()]
 
-    for i, mpn in enumerate(mpns, start=1):
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, mpn))
-            conn.commit()
-        log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Batch item {i}/{len(mpns)} started.")
-        try:
-            result = fetch_live_into_db_for_mpn(
+    max_workers = max(1, min(int(max_workers or 1), 16))
+    future_map = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for i, mpn in enumerate(mpns, start=1):
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, mpn))
+                conn.commit()
+            log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Queue item {i}/{len(mpns)} started.")
+            fut = ex.submit(
+                fetch_live_into_db_for_mpn,
                 mpn,
                 mouser_key=mouser_key,
                 digikey_id=digikey_id,
@@ -2442,10 +2470,55 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 save_to_cells=True,
                 fill_empty_from_fallback=fill_empty_from_fallback,
             )
-            source = str(result.get("source", "")).strip()
-            save_status = str(result.get("status", "")).strip()
+            future_map[fut] = mpn
+
+        for fut in as_completed(future_map):
+            mpn = future_map[fut]
+            try:
+                out = fut.result()
+                if not isinstance(out, dict):
+                    out = {"mpn": mpn, "status": "error", "error": "Invalid worker result type"}
+                out.setdefault("mpn", mpn)
+            except Exception as exn:
+                out = {"mpn": mpn, "status": "error", "error": str(exn)}
+
+            mpn = str(out.get("mpn", "")).strip()
+            if not mpn:
+                continue
+            if str(out.get("status", "")).strip().lower() == "error":
+                err = str(out.get("error", "Unknown queue error"))
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute(
+                        "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
+                        (err, datetime.now(timezone.utc).isoformat(), mpn),
+                    )
+                    conn.execute(
+                        "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
+                        (mpn, datetime.now(timezone.utc).isoformat()),
+                    )
+                    conn.commit()
+                log_scrub_history(mpn, step="process_error", status="error", message=err)
+                processed.append({"mpn": mpn, "status": "error", "error": err})
+                continue
+
+            source = str(out.get("source", "")).strip()
+            save_status = str(out.get("status", "")).strip()
             if save_status not in ("saved", "unified_only"):
-                raise RuntimeError(f"No DB save completed (status={save_status or 'unknown'}).")
+                err = f"No DB save completed (status={save_status or 'unknown'})."
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute(
+                        "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
+                        (err, datetime.now(timezone.utc).isoformat(), mpn),
+                    )
+                    conn.execute(
+                        "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
+                        (mpn, datetime.now(timezone.utc).isoformat()),
+                    )
+                    conn.commit()
+                log_scrub_history(mpn, step="process_error", status="error", message=err)
+                processed.append({"mpn": mpn, "status": "error", "error": err})
+                continue
+
             if save_status == "unified_only":
                 log_scrub_history(
                     mpn,
@@ -2476,25 +2549,26 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 message="Queue item completed and status updated to done.",
             )
             processed.append({"mpn": mpn, "status": "done", "source": source or save_status, "result": save_status})
-        except Exception as ex:
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute(
-                    "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
-                    (str(ex), datetime.now(timezone.utc).isoformat(), mpn),
-                )
-                conn.execute(
-                    "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
-                    (mpn, datetime.now(timezone.utc).isoformat()),
-                )
-                conn.commit()
-            log_scrub_history(
-                mpn,
-                step="process_error",
-                status="error",
-                message=str(ex),
-            )
-            processed.append({"mpn": mpn, "status": "error", "error": str(ex)})
     return processed
+
+
+def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=400):
+    """Drain the full pending/error queue without exposing batch controls in UI."""
+    all_rows = []
+    while True:
+        one_round = process_scrub_queue_batch(
+            batch_size=int(internal_chunk_size),
+            mouser_key=mouser_key,
+            digikey_id=digikey_id,
+            digikey_secret=digikey_secret,
+            digikey_scope=digikey_scope,
+            fill_empty_from_fallback=fill_empty_from_fallback,
+            max_workers=max_workers,
+        )
+        if not one_round:
+            break
+        all_rows.extend(one_round)
+    return all_rows
 
 
 def routine_check_db_mpns(limit, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True):
@@ -2516,6 +2590,61 @@ def routine_check_db_mpns(limit, mouser_key="", digikey_id="", digikey_secret=""
         )
         results.append(result)
     return results
+
+
+_AUTO_RECHECK_STATE = {"running": False, "thread": None, "last_cycle_count": 0, "last_cycle_utc": ""}
+
+
+def _auto_recheck_worker(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, sleep_seconds=5):
+    while _AUTO_RECHECK_STATE.get("running", False):
+        mpns = get_available_db_mpns()
+        cycle_count = 0
+        for i, m in enumerate(mpns, start=1):
+            if not _AUTO_RECHECK_STATE.get("running", False):
+                break
+            try:
+                fetch_live_into_db_for_mpn(
+                    m,
+                    mouser_key=mouser_key,
+                    digikey_id=digikey_id,
+                    digikey_secret=digikey_secret,
+                    digikey_scope=digikey_scope,
+                    priority_order=_rotating_priority_for_index(i - 1, split_mode=False),
+                    save_to_cells=True,
+                    fill_empty_from_fallback=fill_empty_from_fallback,
+                )
+                cycle_count += 1
+            except Exception:
+                pass
+        _AUTO_RECHECK_STATE["last_cycle_count"] = cycle_count
+        _AUTO_RECHECK_STATE["last_cycle_utc"] = datetime.now(timezone.utc).isoformat()
+        if _AUTO_RECHECK_STATE.get("running", False):
+            time.sleep(max(1, int(sleep_seconds or 1)))
+
+
+def start_auto_recheck_loop(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, sleep_seconds=5):
+    if _AUTO_RECHECK_STATE.get("running", False):
+        return False
+    _AUTO_RECHECK_STATE["running"] = True
+    t = threading.Thread(
+        target=_auto_recheck_worker,
+        kwargs={
+            "mouser_key": mouser_key,
+            "digikey_id": digikey_id,
+            "digikey_secret": digikey_secret,
+            "digikey_scope": digikey_scope,
+            "fill_empty_from_fallback": fill_empty_from_fallback,
+            "sleep_seconds": sleep_seconds,
+        },
+        daemon=True,
+    )
+    _AUTO_RECHECK_STATE["thread"] = t
+    t.start()
+    return True
+
+
+def stop_auto_recheck_loop():
+    _AUTO_RECHECK_STATE["running"] = False
 
 # ==========================================
 # 3. INTERFACE
@@ -2566,9 +2695,22 @@ with ui_tabs[0]:
         key="z2_selected_scrub_items",
         help="Only selected items are scraped from Z2.",
     )
+    recheck_from_db = st.toggle("Use DB MPN list for Z2 recheck", value=False, key="z2_recheck_from_db")
     if st.button("Start Automation"):
         if not selected_scrub_items:
             st.error("Please select at least one tab/item to scrub.")
+        elif recheck_from_db and u_name and p_word:
+            db_mpns = get_available_db_mpns()
+            if not db_mpns:
+                st.error("No MPNs found in DB to recheck with Z2.")
+            else:
+                run_scrubbing(
+                    db_mpns,
+                    u_name,
+                    p_word,
+                    run_mode,
+                    selected_tabs=selected_scrub_items,
+                )
         elif up_file and u_name and p_word:
             run_scrubbing(
                 pd.read_excel(up_file).iloc[:,0].dropna().tolist(),
@@ -2589,6 +2731,8 @@ with ui_tabs[0]:
     live_dk_scope = lc1.text_input("Digi-Key Scope (Optional)", value=os.getenv("DIGIKEY_SCOPE", ""), key="live_combo_dk_scope")
     live_mouser = lc2.text_input("Mouser API Key (Optional)", value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK), type="password", key="live_combo_mouser")
     live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Mouser)", value=False, key="live_combo_split_mode")
+    live_workers = st.number_input("Live combo parallel workers", min_value=1, max_value=16, value=4, step=1, key="live_combo_workers")
+    st.caption("Tip: Use 4-8 workers to target ~30+ MPN/min, based on API/network response time.")
     live_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="live_combo_fill_empty")
     if st.button("Start Live Combo Scraper", key="live_combo_run"):
         live_mpns = []
@@ -2599,26 +2743,26 @@ with ui_tabs[0]:
         if not live_mpns:
             st.error("Please upload or enter at least one MPN.")
         else:
-            bar = st.progress(0)
+            start_ts = time.time()
+            bar = st.progress(15)
             status_txt = st.empty()
-            rows = []
-            for i, m in enumerate(live_mpns, start=1):
-                remaining = len(live_mpns) - i
-                status_txt.info(f"Processing {i}/{len(live_mpns)} | Pending: {remaining}")
-                rows.append(
-                    fetch_live_into_db_for_mpn(
-                        m,
-                        mouser_key=live_mouser,
-                        digikey_id=live_dk_id,
-                        digikey_secret=live_dk_secret,
-                        digikey_scope=live_dk_scope,
-                        priority_order=_rotating_priority_for_index(i - 1, split_mode=live_split_mode),
-                        save_to_cells=True,
-                        fill_empty_from_fallback=live_fill_empty,
-                    )
+            status_txt.info(f"Running {len(live_mpns)} MPNs with {int(live_workers)} parallel workers...")
+            def _live_worker(one_mpn, zero_idx):
+                return fetch_live_into_db_for_mpn(
+                    one_mpn,
+                    mouser_key=live_mouser,
+                    digikey_id=live_dk_id,
+                    digikey_secret=live_dk_secret,
+                    digikey_scope=live_dk_scope,
+                    priority_order=_rotating_priority_for_index(zero_idx, split_mode=live_split_mode),
+                    save_to_cells=True,
+                    fill_empty_from_fallback=live_fill_empty,
                 )
-                bar.progress(i / len(live_mpns))
-            status_txt.success(f"Completed {len(live_mpns)}/{len(live_mpns)} | Pending: 0")
+            rows = process_mpns_concurrently(live_mpns, _live_worker, max_workers=int(live_workers))
+            bar.progress(100)
+            elapsed = max(0.001, time.time() - start_ts)
+            rpm = round((len(rows) / elapsed) * 60, 2)
+            status_txt.success(f"Completed {len(rows)}/{len(live_mpns)} | Throughput: {rpm} MPN/min")
             st.dataframe(pd.DataFrame(rows), width="stretch")
             st.success("Live combo scrape complete and saved to DB cells.")
 
@@ -2631,12 +2775,12 @@ with ui_tabs[0]:
     bg_dk_secret = bgc1.text_input("Queue Digi-Key Client Secret", value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK), type="password", key="bg_dk_secret")
     bg_dk_scope = bgc1.text_input("Queue Digi-Key Scope", value=os.getenv("DIGIKEY_SCOPE", ""), key="bg_dk_scope")
     bg_fill_empty = bgc2.toggle("Queue fallback fill empty fields", value=True, key="bg_fill_empty")
+    bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=16, value=4, step=1, key="bg_workers")
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
 
     bg_file = st.file_uploader("Upload full MPN file (col1=MPN, col2=Manufacturer/Make optional)", type=["xlsx", "csv"], key="bg_queue_upload")
-    b1, b2, b3 = st.columns(3)
-    bg_batch_size = b2.number_input("Batch size", min_value=1, max_value=5000, value=200, step=50, key="bg_batch_size")
-    run_batch = b3.button("▶ Run next batch", key="bg_run_batch_btn")
+    b1, b2 = st.columns(2)
+    run_batch = b2.button("▶ Run queue now (process all)", key="bg_run_batch_btn")
     if b1.button("📥 Add file to queue", key="bg_enqueue_btn"):
         out = enqueue_scrub_queue_from_upload(bg_file)
         if out.get("error"):
@@ -2644,34 +2788,37 @@ with ui_tabs[0]:
         else:
             st.success(f"Queued {out['queued']} MPNs. Skipped {out['skipped']} duplicates/blank rows.")
             if auto_run_on_enqueue and int(out.get("queued", 0) or 0) > 0:
-                processed = process_scrub_queue_batch(
-                    int(bg_batch_size),
+                processed = process_scrub_queue_all(
                     mouser_key=bg_mouser,
                     digikey_id=bg_dk_id,
                     digikey_secret=bg_dk_secret,
                     digikey_scope=bg_dk_scope,
                     fill_empty_from_fallback=bg_fill_empty,
+                    max_workers=int(bg_workers),
                 )
                 if processed:
                     st.success(f"Auto-run started immediately and processed {len(processed)} queued rows.")
                     st.dataframe(pd.DataFrame(processed), width="stretch")
                 else:
-                    st.info("Auto-run was enabled, but no rows were processed in the first batch.")
+                    st.info("Auto-run was enabled, but no pending rows were available.")
 
     if run_batch:
-        processed = process_scrub_queue_batch(
-            int(bg_batch_size),
+        start_ts = time.time()
+        all_processed = process_scrub_queue_all(
             mouser_key=bg_mouser,
             digikey_id=bg_dk_id,
             digikey_secret=bg_dk_secret,
             digikey_scope=bg_dk_scope,
             fill_empty_from_fallback=bg_fill_empty,
+            max_workers=int(bg_workers),
         )
-        if not processed:
+        if not all_processed:
             st.info("No pending queue rows. Queue is idle.")
         else:
-            st.success(f"Processed {len(processed)} queue rows in this run.")
-            st.dataframe(pd.DataFrame(processed), width="stretch")
+            elapsed = max(0.001, time.time() - start_ts)
+            rpm = round((len(all_processed) / elapsed) * 60, 2)
+            st.success(f"Processed {len(all_processed)} queue rows | Throughput: {rpm} MPN/min")
+            st.dataframe(pd.DataFrame(all_processed), width="stretch")
 
     with sqlite3.connect(DB_PATH) as conn:
         qstats = pd.read_sql("SELECT status, COUNT(1) AS cnt FROM scrub_queue GROUP BY status ORDER BY status", conn)
@@ -2728,6 +2875,25 @@ with ui_tabs[0]:
 
 with ui_tabs[1]:
     st.subheader("Database Management")
+    st.markdown("#### Lifecycle Status Statistics (from DB)")
+    if DB_PATH.exists():
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                lc_stats = pd.read_sql(
+                    """
+                    SELECT COALESCE(NULLIF(TRIM(lifecycle_status),''), 'Unknown') AS lifecycle_status, COUNT(1) AS cnt
+                    FROM unified_part_cache
+                    GROUP BY COALESCE(NULLIF(TRIM(lifecycle_status),''), 'Unknown')
+                    ORDER BY cnt DESC, lifecycle_status
+                    """,
+                    conn,
+                )
+            if lc_stats.empty:
+                st.caption("No lifecycle data found in unified_part_cache yet.")
+            else:
+                st.dataframe(lc_stats, width="stretch", hide_index=True)
+        except Exception as ex:
+            st.warning(f"Could not load lifecycle statistics: {ex}")
     if st.button("🔨 Rebuild DB from Saved HTML (Optional)"):
         import html_to_sqlite
         html_to_sqlite.main()
@@ -2750,6 +2916,12 @@ with ui_tabs[1]:
     rc_dk_scope = rc1.text_input("Routine Digi-Key Scope (Optional)", value=os.getenv("DIGIKEY_SCOPE", ""), key="routine_dk_scope")
     rc_fill = rc2.toggle("Routine fallback fill empty fields", value=True, key="routine_fill_empty")
     rc_limit = st.number_input("Routine MPN limit from DB", min_value=1, max_value=50000, value=200, step=50, key="routine_limit")
+    rc_sleep = st.number_input("Continuous recheck pause (seconds)", min_value=1, max_value=3600, value=5, step=1, key="routine_sleep_sec")
+    rc_state_col1, rc_state_col2 = st.columns(2)
+    rc_state_col1.metric("Auto Recheck", "Running" if _AUTO_RECHECK_STATE.get("running") else "Stopped")
+    rc_state_col2.metric("Last Cycle MPN Count", int(_AUTO_RECHECK_STATE.get("last_cycle_count", 0) or 0))
+    if _AUTO_RECHECK_STATE.get("last_cycle_utc"):
+        st.caption(f"Last cycle completed at (UTC): {_AUTO_RECHECK_STATE.get('last_cycle_utc')}")
     if st.button("🔄 Run Routine Check Now", key="routine_check_run_btn"):
         routine_results = routine_check_db_mpns(
             rc_limit,
@@ -2761,6 +2933,23 @@ with ui_tabs[1]:
         )
         st.success(f"Routine check completed for {len(routine_results)} MPN(s).")
         st.dataframe(pd.DataFrame(routine_results), width="stretch")
+    rc_b1, rc_b2 = st.columns(2)
+    if rc_b1.button("▶ Start Continuous DB Recheck", key="start_auto_recheck_btn"):
+        started = start_auto_recheck_loop(
+            mouser_key=rc_mouser,
+            digikey_id=rc_dk_id,
+            digikey_secret=rc_dk_secret,
+            digikey_scope=rc_dk_scope,
+            fill_empty_from_fallback=rc_fill,
+            sleep_seconds=int(rc_sleep),
+        )
+        if started:
+            st.success("Continuous DB recheck started in background thread.")
+        else:
+            st.info("Continuous DB recheck is already running.")
+    if rc_b2.button("⏹ Stop Continuous DB Recheck", key="stop_auto_recheck_btn"):
+        stop_auto_recheck_loop()
+        st.warning("Continuous DB recheck stop requested.")
     show_footer()
 
 with ui_tabs[2]:
@@ -2959,8 +3148,8 @@ with ui_tabs[3]:
                 "operating_temperature": "OPERATING TEMPERATURE",
                 "component_thickness": "Component thickness",
                 "reach": "Reach",
-                "reflow_soldering_time": "Reflow soldering time",
-                "wave_soldering_time": "Wave soldering time",
+                "reflow_soldering_time": "Reflow solder time",
+                "wave_soldering_time": "Wave solder time",
                 "body_mark": "Body mark",
             }
             export_df = udf.rename(columns=rename_map)
@@ -2982,8 +3171,8 @@ with ui_tabs[3]:
                 "OPERATING TEMPERATURE",
                 "Component thickness",
                 "Reach",
-                "Reflow soldering time",
-                "Wave soldering time",
+                "Reflow solder time",
+                "Wave solder time",
                 "Body mark",
             ]
             for c in export_cols:
@@ -3037,8 +3226,8 @@ with ui_tabs[3]:
         manual_operating = n2.text_input("OPERATING TEMPERATURE")
         manual_component_thickness = n3.text_input("Component thickness")
         manual_reach = n3.text_input("Reach")
-        manual_reflow_time = n3.text_input("Reflow soldering time")
-        manual_wave_time = n3.text_input("Wave soldering time")
+        manual_reflow_time = n3.text_input("Reflow solder time")
+        manual_wave_time = n3.text_input("Wave solder time")
         manual_body_mark = n3.text_input("Body mark")
         manual_source = n3.text_input("Source Trace", value="ManualEntry")
         save_manual = st.form_submit_button("💾 Save Manual Entry")
