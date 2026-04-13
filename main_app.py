@@ -38,6 +38,9 @@ TABS = [
 ]
 
 DEV_INFO = "Developed by :- Shashank C | Mail ID:- shashank.c@kaynestechnology.net"
+SOURCE_MOUSER = "Mouser"
+SOURCE_DIGIKEY = "Digi-Key"
+SOURCE_NEXAR = "Octopart/Nexar"
 # Prefer environment variables first, then built-in defaults so manual entry is not required each run.
 MOUSER_API_KEY_FALLBACK = os.getenv("MOUSER_API_KEY", "a5d0cdf4-c5b6-4600-88ab-12290f19e2cc")
 DIGIKEY_CLIENT_ID_FALLBACK = os.getenv("DIGIKEY_CLIENT_ID", "AyNFvUvmDoGUTtIyeDAhqE1BsHzQ9HNlMM2CoKurruURHJPl")
@@ -426,7 +429,7 @@ def fetch_mouser_batch(mpns, api_key):
             else:
                 batch_rows.append({
                     "Requested MPN": clean_mpn,
-                    "Description": "No result found from Source A",
+                    "Description": f"No result found from {SOURCE_MOUSER}",
                 })
         except Exception as ex:
             batch_rows.append({
@@ -467,10 +470,10 @@ def get_digikey_access_token(client_id, client_secret, use_sandbox=False, timeou
             detail = e.read().decode("utf-8")
         except Exception:
             detail = str(e)
-        raise RuntimeError(f"Source B token error {e.code}: {detail[:400]}") from e
+        raise RuntimeError(f"{SOURCE_DIGIKEY} token error {e.code}: {detail[:400]}") from e
     token = token_data.get("access_token")
     if not token:
-        raise ValueError("Source B access token not returned.")
+        raise ValueError(f"{SOURCE_DIGIKEY} access token not returned.")
     expires_in = int(token_data.get("expires_in", 900) or 900)
     _DIGIKEY_TOKEN_CACHE[cache_key] = {
         "token": str(token),
@@ -484,16 +487,16 @@ def format_source_b_error(ex):
     msg_l = msg.lower()
     if "401" in msg and "invalid clientid" in msg_l:
         return (
-            "Source B returned 401 invalid client id. If Sandbox is ON, you must use sandbox-approved "
-            "Digi-Key credentials. If you only have production credentials, turn Sandbox OFF."
+            f"{SOURCE_DIGIKEY} returned 401 invalid client id. If Sandbox is ON, you must use sandbox-approved "
+            f"{SOURCE_DIGIKEY} credentials. If you only have production credentials, turn Sandbox OFF."
         )
     if "403" in msg and "not authorized to perform this request" in msg_l:
         return (
-            "Source B returned 403 Forbidden. Use your own approved Digi-Key API app credentials, "
+            f"{SOURCE_DIGIKEY} returned 403 Forbidden. Use your own approved {SOURCE_DIGIKEY} API app credentials, "
             "ensure Product Information API access is enabled, and make sure Sandbox/Production mode "
             "matches your credential type."
         )
-    return f"Source B fetch issue: {msg}"
+    return f"{SOURCE_DIGIKEY} fetch issue: {msg}"
 
 
 def fetch_digikey_part_data(
@@ -529,32 +532,43 @@ def fetch_digikey_part_data(
             host = "api.digikey.com"
         else:
             raise
-    common_headers = {
-        "Authorization": f"Bearer {token}",
-        "X-DIGIKEY-Client-Id": str(client_id).strip(),
-        "X-DIGIKEY-Locale-Site": site,
-        "X-DIGIKEY-Locale-Currency": currency,
-        "X-DIGIKEY-Locale-Language": language,
-        "Accept": "application/json",
-    }
+    locale_attempts = []
+    for one_site, one_currency, one_language in [
+        (site, currency, language),
+        ("US", "USD", "en"),
+        ("IN", "INR", "en"),
+    ]:
+        key = (str(one_site).strip(), str(one_currency).strip(), str(one_language).strip())
+        if key not in locale_attempts:
+            locale_attempts.append(key)
 
-    # 1) Exact productdetails path
     product = {}
-    encoded_part = parse.quote(str(part_number).strip())
-    details_url = f"https://{host}/products/v4/search/{encoded_part}/productdetails"
-    details_req = request.Request(url=details_url, headers=common_headers, method="GET")
-    try:
-        with request.urlopen(details_req, timeout=timeout) as resp:
-            details_data = json.loads(resp.read().decode("utf-8") or "{}")
-        possible = details_data.get("Product", details_data) if isinstance(details_data, dict) else {}
-        if isinstance(possible, dict):
-            product = possible
-    except HTTPError:
-        # Fallback to keyword endpoint below
-        product = {}
+    keyword_errors = []
+    for one_site, one_currency, one_language in locale_attempts:
+        common_headers = {
+            "Authorization": f"Bearer {token}",
+            "X-DIGIKEY-Client-Id": str(client_id).strip(),
+            "X-DIGIKEY-Locale-Site": one_site,
+            "X-DIGIKEY-Locale-Currency": one_currency,
+            "X-DIGIKEY-Locale-Language": one_language,
+            "Accept": "application/json",
+        }
 
-    # 2) Keyword fallback (more tolerant for MPN formats)
-    if not product:
+        # 1) Exact productdetails path
+        encoded_part = parse.quote(str(part_number).strip())
+        details_url = f"https://{host}/products/v4/search/{encoded_part}/productdetails"
+        details_req = request.Request(url=details_url, headers=common_headers, method="GET")
+        try:
+            with request.urlopen(details_req, timeout=timeout) as resp:
+                details_data = json.loads(resp.read().decode("utf-8") or "{}")
+            possible = details_data.get("Product", details_data) if isinstance(details_data, dict) else {}
+            if isinstance(possible, dict) and any(possible.values()):
+                product = possible
+                break
+        except HTTPError:
+            product = {}
+
+        # 2) Keyword fallback (more tolerant for MPN formats)
         keyword_url = f"https://{host}/products/v4/search/keyword"
         keyword_payload = {
             "Keywords": str(part_number).strip(),
@@ -572,13 +586,17 @@ def fetch_digikey_part_data(
             products = key_data.get("Products", []) if isinstance(key_data, dict) else []
             if products and isinstance(products[0], dict):
                 product = products[0]
+                break
         except HTTPError as e:
             detail = ""
             try:
                 detail = e.read().decode("utf-8")
             except Exception:
                 detail = str(e)
-            raise RuntimeError(f"Source B keyword error {e.code}: {detail[:400]}") from e
+            keyword_errors.append(f"{one_site}/{one_currency}: {e.code} {detail[:140]}")
+
+    if not product and keyword_errors:
+        raise RuntimeError(f"{SOURCE_DIGIKEY} keyword error: {' | '.join(keyword_errors[:3])}")
 
     if not isinstance(product, dict):
         product = {}
@@ -674,7 +692,7 @@ def fetch_digikey_part_data(
     }
 
 
-def fetch_digikey_batch(mpns, client_id, client_secret, site="IN", currency="INR", language="en", use_sandbox=False, scope=None):
+def fetch_digikey_batch(mpns, client_id, client_secret, site="US", currency="USD", language="en", use_sandbox=False, scope=None):
     rows = []
     for mpn in mpns:
         clean = str(mpn).strip()
@@ -694,7 +712,7 @@ def fetch_digikey_batch(mpns, client_id, client_secret, site="IN", currency="INR
             if out.get("parts"):
                 rows.extend(out["parts"])
             else:
-                rows.append({"Requested MPN": clean, "Description": "No result found from Source B"})
+                rows.append({"Requested MPN": clean, "Description": f"No result found from {SOURCE_DIGIKEY}"})
         except Exception as ex:
             rows.append({"Requested MPN": clean, "Description": f"Error: {ex}"})
     return rows
@@ -1222,7 +1240,14 @@ def upsert_unified_part_for_mpn(mpn):
             conn,
             params=(mpn,),
         )
-        source_priority = {"Source B": 1, "Nexar": 2, "Source A": 3}
+        source_priority = {
+            SOURCE_DIGIKEY: 1,
+            "Source B": 1,
+            SOURCE_NEXAR: 2,
+            "Nexar": 2,
+            SOURCE_MOUSER: 3,
+            "Source A": 3,
+        }
         if not live_df.empty:
             live_df["priority"] = live_df["selected_source"].map(source_priority).fillna(99)
             live_df = live_df.sort_values(["priority", "fetched_at_utc"], ascending=[True, False])
@@ -2107,12 +2132,12 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                         client_id=digikey_id.strip(),
                         client_secret=digikey_secret.strip(),
                         scope=digikey_scope.strip() or None,
-                        site="IN",
-                        currency="INR",
+                        site="US",
+                        currency="USD",
                     )
                     if pb.get("parts"):
                         payloads.append(pb)
-                        sources.append("Source B")
+                        sources.append(SOURCE_DIGIKEY)
                         if isinstance(pb["parts"][0], dict) and _coverage_score(pb["parts"][0]) > _coverage_score(best_part):
                             best_part = pb["parts"][0]
                 except Exception:
@@ -2122,7 +2147,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                     pa = fetch_mouser_part_data(one_mpn, mouser_key.strip())
                     if pa.get("parts"):
                         payloads.append(pa)
-                        sources.append("Source A")
+                        sources.append(SOURCE_MOUSER)
                         if isinstance(pa["parts"][0], dict) and _coverage_score(pa["parts"][0]) > _coverage_score(best_part):
                             best_part = pa["parts"][0]
                 except Exception:
@@ -2136,7 +2161,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                     )
                     if pn.get("parts"):
                         payloads.append(pn)
-                        sources.append("Nexar")
+                        sources.append(SOURCE_NEXAR)
                         if isinstance(pn["parts"][0], dict) and _coverage_score(pn["parts"][0]) > _coverage_score(best_part):
                             best_part = pn["parts"][0]
                 except Exception:
@@ -2642,10 +2667,10 @@ with ui_tabs[2]:
             type="password",
             key="pending_nexar_secret",
         )
-        pending_split_mode = st.toggle("Fast split mode (Round-robin first hit: Mouser → Digi-Key → Octopart)", value=False, key="pending_split_mode")
+        pending_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Octopart → Mouser)", value=False, key="pending_split_mode")
         pending_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="pending_fill_empty")
         st.write("Pending MPNs:", st.session_state.get("pending_mpns", []))
-        if st.button("▶ Fetch Pending MPNs (Digi-Key → Mouser → Octopart)", key="fetch_pending_mpns"):
+        if st.button("▶ Fetch Pending MPNs (Digi-Key → Octopart → Mouser)", key="fetch_pending_mpns"):
             pending = st.session_state.get("pending_mpns", [])
             if not pending:
                 st.info("Pending list is empty.")
@@ -2951,37 +2976,37 @@ with ui_tabs[4]:
     st.subheader("🏆 Live Price Comparison")
     c1, c2 = st.columns(2)
     cmp_source_a_key = c1.text_input(
-        "Source A API Key",
+        f"{SOURCE_MOUSER} API Key",
         value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK),
         type="password",
         key="cmp_source_a_key",
     )
     cmp_source_b_id = c2.text_input(
-        "Source B Client ID",
+        f"{SOURCE_DIGIKEY} Client ID",
         value=os.getenv("DIGIKEY_CLIENT_ID", DIGIKEY_CLIENT_ID_FALLBACK),
         key="cmp_source_b_id",
     )
     cmp_source_b_secret = c2.text_input(
-        "Source B Client Secret",
+        f"{SOURCE_DIGIKEY} Client Secret",
         value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK),
         type="password",
         key="cmp_source_b_secret",
     )
     cmp_scope = c2.text_input(
-        "Source B Scope",
+        f"{SOURCE_DIGIKEY} Scope",
         value=os.getenv("DIGIKEY_SCOPE", ""),
         key="cmp_source_b_scope",
     )
-    cmp_sandbox = c2.toggle("Use Source B Sandbox", value=False, key="cmp_source_b_sandbox")
+    cmp_sandbox = c2.toggle(f"Use {SOURCE_DIGIKEY} Sandbox", value=False, key="cmp_source_b_sandbox")
     cmp_mpn = st.text_input("Enter MPN", key="cmp_mpn")
 
     if st.button("Compare Price", key="compare_price_btn"):
         if not cmp_mpn.strip():
             st.error("Enter MPN")
         elif not cmp_source_a_key.strip():
-            st.error("Enter Source A API Key")
+            st.error(f"Enter {SOURCE_MOUSER} API Key")
         elif not cmp_source_b_id.strip() or not cmp_source_b_secret.strip():
-            st.error("Enter Source B credentials")
+            st.error(f"Enter {SOURCE_DIGIKEY} credentials")
         else:
             comparison = compare_suppliers_price(
                 cmp_mpn.strip(),
