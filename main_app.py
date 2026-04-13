@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import sqlite3
 import time
@@ -38,6 +39,9 @@ TABS = [
 ]
 
 DEV_INFO = "Developed by :- Shashank C | Mail ID:- shashank.c@kaynestechnology.net"
+SOURCE_MOUSER = "Mouser"
+SOURCE_DIGIKEY = "Digi-Key"
+SOURCE_NEXAR = "Octopart/Nexar"
 # Prefer environment variables first, then built-in defaults so manual entry is not required each run.
 MOUSER_API_KEY_FALLBACK = os.getenv("MOUSER_API_KEY", "a5d0cdf4-c5b6-4600-88ab-12290f19e2cc")
 DIGIKEY_CLIENT_ID_FALLBACK = os.getenv("DIGIKEY_CLIENT_ID", "AyNFvUvmDoGUTtIyeDAhqE1BsHzQ9HNlMM2CoKurruURHJPl")
@@ -133,7 +137,19 @@ def add_enrichment_fields(parts, attributes, pricing):
     operating_temp = _extract_attribute_value(attributes, "operating temperature", "temperature range", "operating temp")
     lsl = _extract_attribute_value(attributes, "lsl", "land side", "lead surface")
     package = _extract_attribute_value(attributes, "package", "case", "mounting package")
-    component_thickness = _extract_attribute_value(attributes, "component thickness", "thickness", "height")
+    component_thickness = _extract_attribute_value(
+        attributes,
+        "component thickness",
+        "thickness",
+        "height",
+        "maximum height",
+        "max height",
+        "package height",
+        "seating height",
+        "size / dimension",
+        "size",
+        "length",
+    )
     reach = _extract_attribute_value(attributes, "reach")
     reflow_time = _extract_attribute_value(attributes, "reflow soldering time", "reflow time", "time at reflow")
     wave_time = _extract_attribute_value(attributes, "wave soldering time", "wave time")
@@ -426,7 +442,7 @@ def fetch_mouser_batch(mpns, api_key):
             else:
                 batch_rows.append({
                     "Requested MPN": clean_mpn,
-                    "Description": "No result found from Source A",
+                    "Description": f"No result found from {SOURCE_MOUSER}",
                 })
         except Exception as ex:
             batch_rows.append({
@@ -467,10 +483,10 @@ def get_digikey_access_token(client_id, client_secret, use_sandbox=False, timeou
             detail = e.read().decode("utf-8")
         except Exception:
             detail = str(e)
-        raise RuntimeError(f"Source B token error {e.code}: {detail[:400]}") from e
+        raise RuntimeError(f"{SOURCE_DIGIKEY} token error {e.code}: {detail[:400]}") from e
     token = token_data.get("access_token")
     if not token:
-        raise ValueError("Source B access token not returned.")
+        raise ValueError(f"{SOURCE_DIGIKEY} access token not returned.")
     expires_in = int(token_data.get("expires_in", 900) or 900)
     _DIGIKEY_TOKEN_CACHE[cache_key] = {
         "token": str(token),
@@ -484,16 +500,16 @@ def format_source_b_error(ex):
     msg_l = msg.lower()
     if "401" in msg and "invalid clientid" in msg_l:
         return (
-            "Source B returned 401 invalid client id. If Sandbox is ON, you must use sandbox-approved "
-            "Digi-Key credentials. If you only have production credentials, turn Sandbox OFF."
+            f"{SOURCE_DIGIKEY} returned 401 invalid client id. If Sandbox is ON, you must use sandbox-approved "
+            f"{SOURCE_DIGIKEY} credentials. If you only have production credentials, turn Sandbox OFF."
         )
     if "403" in msg and "not authorized to perform this request" in msg_l:
         return (
-            "Source B returned 403 Forbidden. Use your own approved Digi-Key API app credentials, "
+            f"{SOURCE_DIGIKEY} returned 403 Forbidden. Use your own approved {SOURCE_DIGIKEY} API app credentials, "
             "ensure Product Information API access is enabled, and make sure Sandbox/Production mode "
             "matches your credential type."
         )
-    return f"Source B fetch issue: {msg}"
+    return f"{SOURCE_DIGIKEY} fetch issue: {msg}"
 
 
 def fetch_digikey_part_data(
@@ -529,32 +545,43 @@ def fetch_digikey_part_data(
             host = "api.digikey.com"
         else:
             raise
-    common_headers = {
-        "Authorization": f"Bearer {token}",
-        "X-DIGIKEY-Client-Id": str(client_id).strip(),
-        "X-DIGIKEY-Locale-Site": site,
-        "X-DIGIKEY-Locale-Currency": currency,
-        "X-DIGIKEY-Locale-Language": language,
-        "Accept": "application/json",
-    }
+    locale_attempts = []
+    for one_site, one_currency, one_language in [
+        (site, currency, language),
+        ("US", "USD", "en"),
+        ("IN", "INR", "en"),
+    ]:
+        key = (str(one_site).strip(), str(one_currency).strip(), str(one_language).strip())
+        if key not in locale_attempts:
+            locale_attempts.append(key)
 
-    # 1) Exact productdetails path
     product = {}
-    encoded_part = parse.quote(str(part_number).strip())
-    details_url = f"https://{host}/products/v4/search/{encoded_part}/productdetails"
-    details_req = request.Request(url=details_url, headers=common_headers, method="GET")
-    try:
-        with request.urlopen(details_req, timeout=timeout) as resp:
-            details_data = json.loads(resp.read().decode("utf-8") or "{}")
-        possible = details_data.get("Product", details_data) if isinstance(details_data, dict) else {}
-        if isinstance(possible, dict):
-            product = possible
-    except HTTPError:
-        # Fallback to keyword endpoint below
-        product = {}
+    keyword_errors = []
+    for one_site, one_currency, one_language in locale_attempts:
+        common_headers = {
+            "Authorization": f"Bearer {token}",
+            "X-DIGIKEY-Client-Id": str(client_id).strip(),
+            "X-DIGIKEY-Locale-Site": one_site,
+            "X-DIGIKEY-Locale-Currency": one_currency,
+            "X-DIGIKEY-Locale-Language": one_language,
+            "Accept": "application/json",
+        }
 
-    # 2) Keyword fallback (more tolerant for MPN formats)
-    if not product:
+        # 1) Exact productdetails path
+        encoded_part = parse.quote(str(part_number).strip())
+        details_url = f"https://{host}/products/v4/search/{encoded_part}/productdetails"
+        details_req = request.Request(url=details_url, headers=common_headers, method="GET")
+        try:
+            with request.urlopen(details_req, timeout=timeout) as resp:
+                details_data = json.loads(resp.read().decode("utf-8") or "{}")
+            possible = details_data.get("Product", details_data) if isinstance(details_data, dict) else {}
+            if isinstance(possible, dict) and any(possible.values()):
+                product = possible
+                break
+        except HTTPError:
+            product = {}
+
+        # 2) Keyword fallback (more tolerant for MPN formats)
         keyword_url = f"https://{host}/products/v4/search/keyword"
         keyword_payload = {
             "Keywords": str(part_number).strip(),
@@ -572,13 +599,17 @@ def fetch_digikey_part_data(
             products = key_data.get("Products", []) if isinstance(key_data, dict) else []
             if products and isinstance(products[0], dict):
                 product = products[0]
+                break
         except HTTPError as e:
             detail = ""
             try:
                 detail = e.read().decode("utf-8")
             except Exception:
                 detail = str(e)
-            raise RuntimeError(f"Source B keyword error {e.code}: {detail[:400]}") from e
+            keyword_errors.append(f"{one_site}/{one_currency}: {e.code} {detail[:140]}")
+
+    if not product and keyword_errors:
+        raise RuntimeError(f"{SOURCE_DIGIKEY} keyword error: {' | '.join(keyword_errors[:3])}")
 
     if not isinstance(product, dict):
         product = {}
@@ -674,7 +705,7 @@ def fetch_digikey_part_data(
     }
 
 
-def fetch_digikey_batch(mpns, client_id, client_secret, site="IN", currency="INR", language="en", use_sandbox=False, scope=None):
+def fetch_digikey_batch(mpns, client_id, client_secret, site="US", currency="USD", language="en", use_sandbox=False, scope=None):
     rows = []
     for mpn in mpns:
         clean = str(mpn).strip()
@@ -694,7 +725,7 @@ def fetch_digikey_batch(mpns, client_id, client_secret, site="IN", currency="INR
             if out.get("parts"):
                 rows.extend(out["parts"])
             else:
-                rows.append({"Requested MPN": clean, "Description": "No result found from Source B"})
+                rows.append({"Requested MPN": clean, "Description": f"No result found from {SOURCE_DIGIKEY}"})
         except Exception as ex:
             rows.append({"Requested MPN": clean, "Description": f"Error: {ex}"})
     return rows
@@ -1212,7 +1243,8 @@ def upsert_unified_part_for_mpn(mpn):
             for k in unified.keys():
                 if k == "mpn":
                     continue
-                unified[k] = _as_text(existing_row.get(k, "")).strip()
+                val = _as_text(existing_row.get(k, "")).strip()
+                unified[k] = "" if _is_effectively_empty(val) else val
             prior_trace = _as_text(existing_row.get("source_trace", "")).strip()
             if prior_trace:
                 used_sources.extend([s.strip() for s in prior_trace.split(",") if s.strip()])
@@ -1222,7 +1254,14 @@ def upsert_unified_part_for_mpn(mpn):
             conn,
             params=(mpn,),
         )
-        source_priority = {"Source B": 1, "Nexar": 2, "Source A": 3}
+        source_priority = {
+            SOURCE_DIGIKEY: 1,
+            "Source B": 1,
+            SOURCE_NEXAR: 2,
+            "Nexar": 2,
+            SOURCE_MOUSER: 3,
+            "Source A": 3,
+        }
         if not live_df.empty:
             live_df["priority"] = live_df["selected_source"].map(source_priority).fillna(99)
             live_df = live_df.sort_values(["priority", "fetched_at_utc"], ascending=[True, False])
@@ -1237,44 +1276,32 @@ def upsert_unified_part_for_mpn(mpn):
             p = parts[0] if isinstance(parts, list) and parts and isinstance(parts[0], dict) else {}
             if not p:
                 continue
-            unified["manufacturer"] = unified["manufacturer"] or _as_text(p.get("Manufacturer", ""))
-            unified["manufacturer_part_number"] = unified["manufacturer_part_number"] or _as_text(p.get("Manufacturer Part Number", ""))
-            unified["supplier_part_number"] = unified["supplier_part_number"] or _as_text(p.get("Supplier Part Number", ""))
-            unified["description"] = unified["description"] or _as_text(p.get("Description", ""))
-            unified["category"] = unified["category"] or _as_text(p.get("Category", ""))
-            unified["lifecycle_status"] = unified["lifecycle_status"] or _first_non_empty([
-                p.get("Lifecycle Status", ""),
-                p.get("Part Status", ""),
-                p.get("Product Status", ""),
-            ])
-            if not str(unified["lifecycle_status"]).strip():
-                unified["lifecycle_status"] = _extract_attribute_value(attrs, "lifecycle", "part status", "product status", "status")
-            unified["rohs"] = unified["rohs"] or _first_non_empty([p.get("ROHS", ""), p.get("RoHS", "")])
-            unified["stock"] = unified["stock"] or _first_non_empty([p.get("Stock", ""), p.get("Quantity Available", "")])
-            unified["datasheet_url"] = unified["datasheet_url"] or _as_text(p.get("Data Sheet URL", ""))
-            unified["product_url"] = unified["product_url"] or _as_text(p.get("Product URL", ""))
-            unified["msd_level"] = unified["msd_level"] or _as_text(p.get("MSD LEVEL", ""))
-            unified["reflow_soldering_temperature"] = unified["reflow_soldering_temperature"] or _as_text(p.get("REFLOW SOLDERING TEMPERATURE", ""))
-            unified["thermal_cycle"] = unified["thermal_cycle"] or _as_text(p.get("THERMAL CYCLE", ""))
-            unified["wave_soldering_temperature"] = unified["wave_soldering_temperature"] or _as_text(p.get("WAVE SOLDERING TEMPERATURE", ""))
-            unified["lsl_details"] = unified["lsl_details"] or _as_text(p.get("LSL DETAILS", ""))
-            unified["package_details"] = unified["package_details"] or _as_text(p.get("PACKAGE", ""))
-            unified["price_details"] = unified["price_details"] or _as_text(p.get("PRICE DETAILS", ""))
-            unified["operating_temperature"] = unified["operating_temperature"] or _as_text(p.get("OPERATING TEMPERATURE", ""))
-            unified["component_thickness"] = unified["component_thickness"] or _as_text(p.get("COMPONENT THICKNESS", ""))
-            unified["reach"] = unified["reach"] or _as_text(p.get("REACH", ""))
-            unified["reflow_soldering_time"] = unified["reflow_soldering_time"] or _as_text(p.get("REFLOW SOLDERING TIME", ""))
-            unified["wave_soldering_time"] = unified["wave_soldering_time"] or _as_text(p.get("WAVE SOLDERING TIME", ""))
-            unified["body_mark"] = unified["body_mark"] or _as_text(p.get("BODY MARK", ""))
-            unified["msd_level"] = unified["msd_level"] or _extract_attribute_value(attrs, "msl", "msd", "moisture sensitivity")
-            unified["reflow_soldering_temperature"] = unified["reflow_soldering_temperature"] or _extract_attribute_value(attrs, "reflow temperature", "reflow soldering temperature", "reflow")
-            unified["thermal_cycle"] = unified["thermal_cycle"] or _extract_attribute_value(attrs, "thermal cycle", "reflow cycle", "number of reflow")
-            unified["wave_soldering_temperature"] = unified["wave_soldering_temperature"] or _extract_attribute_value(attrs, "wave soldering temperature", "wave solder")
-            unified["lsl_details"] = unified["lsl_details"] or _extract_attribute_value(attrs, "lsl", "lead surface", "land side")
-            unified["package_details"] = unified["package_details"] or _extract_attribute_value(attrs, "package", "case", "mount")
-            unified["operating_temperature"] = unified["operating_temperature"] or _extract_attribute_value(attrs, "operating temperature", "temperature range", "operating temp")
-            unified["component_thickness"] = unified["component_thickness"] or _extract_attribute_value(attrs, "component thickness", "thickness", "height")
-            unified["reach"] = unified["reach"] or _extract_attribute_value(attrs, "reach", "reach compliance", "compliance")
+            def _set_if_missing(field_name, value):
+                if _is_effectively_empty(unified.get(field_name, "")) and not _is_effectively_empty(value):
+                    unified[field_name] = _as_text(value)
+
+            _set_if_missing("manufacturer", p.get("Manufacturer", ""))
+            _set_if_missing("manufacturer_part_number", p.get("Manufacturer Part Number", ""))
+            _set_if_missing("supplier_part_number", p.get("Supplier Part Number", ""))
+            _set_if_missing("description", p.get("Description", ""))
+            _set_if_missing("category", p.get("Category", ""))
+            _set_if_missing("lifecycle_status", _first_non_empty([p.get("Lifecycle Status", ""), p.get("Part Status", ""), p.get("Product Status", "")]))
+            if _is_effectively_empty(unified["lifecycle_status"]):
+                _set_if_missing("lifecycle_status", _extract_attribute_value(attrs, "lifecycle", "part status", "product status", "status"))
+            _set_if_missing("rohs", _first_non_empty([p.get("ROHS", ""), p.get("RoHS", "")]))
+            _set_if_missing("stock", _first_non_empty([p.get("Stock", ""), p.get("Quantity Available", "")]))
+            _set_if_missing("datasheet_url", p.get("Data Sheet URL", ""))
+            _set_if_missing("product_url", p.get("Product URL", ""))
+            _set_if_missing("msd_level", _first_non_empty([p.get("MSD LEVEL", ""), _extract_attribute_value(attrs, "msl", "msd", "moisture sensitivity")]))
+            _set_if_missing("reflow_soldering_temperature", _first_non_empty([p.get("REFLOW SOLDERING TEMPERATURE", ""), _extract_attribute_value(attrs, "reflow temperature", "reflow soldering temperature", "reflow")]))
+            _set_if_missing("thermal_cycle", _first_non_empty([p.get("THERMAL CYCLE", ""), _extract_attribute_value(attrs, "thermal cycle", "reflow cycle", "number of reflow")]))
+            _set_if_missing("wave_soldering_temperature", _first_non_empty([p.get("WAVE SOLDERING TEMPERATURE", ""), _extract_attribute_value(attrs, "wave soldering temperature", "wave solder")]))
+            _set_if_missing("lsl_details", _first_non_empty([p.get("LSL DETAILS", ""), _extract_attribute_value(attrs, "lsl", "lead surface", "land side")]))
+            _set_if_missing("package_details", _first_non_empty([p.get("PACKAGE", ""), _extract_attribute_value(attrs, "package", "case", "mount")]))
+            _set_if_missing("price_details", _first_non_empty([p.get("PRICE DETAILS", ""), _extract_price_summary(payload.get("pricing", []) if isinstance(payload, dict) else [])]))
+            _set_if_missing("operating_temperature", _first_non_empty([p.get("OPERATING TEMPERATURE", ""), _extract_attribute_value(attrs, "operating temperature", "temperature range", "operating temp")]))
+            _set_if_missing("component_thickness", _first_non_empty([p.get("COMPONENT THICKNESS", ""), _extract_attribute_value(attrs, "component thickness", "thickness", "height", "maximum height", "max height", "package height", "seating height", "size / dimension", "size", "length")]))
+            _set_if_missing("reach", _first_non_empty([p.get("REACH", ""), _extract_attribute_value(attrs, "reach", "reach compliance", "compliance")]))
             if not str(unified["reach"]).strip():
                 reach_candidates = []
                 for a in attrs if isinstance(attrs, list) else []:
@@ -1288,12 +1315,12 @@ def upsert_unified_part_for_mpn(mpn):
                         reach_candidates.append(vv)
                 if reach_candidates:
                     unified["reach"] = "; ".join(dict.fromkeys(reach_candidates))
-            unified["reflow_soldering_time"] = unified["reflow_soldering_time"] or _extract_attribute_value(attrs, "reflow time", "reflow soldering time", "time at reflow")
-            unified["wave_soldering_time"] = unified["wave_soldering_time"] or _extract_attribute_value(attrs, "wave time", "wave soldering time")
-            unified["body_mark"] = unified["body_mark"] or _extract_attribute_value(attrs, "body mark", "marking")
-            unified["rohs"] = unified["rohs"] or _extract_attribute_value(attrs, "rohs", "rohs status")
+            _set_if_missing("reflow_soldering_time", _first_non_empty([p.get("REFLOW SOLDERING TIME", ""), _extract_attribute_value(attrs, "reflow time", "reflow soldering time", "time at reflow")]))
+            _set_if_missing("wave_soldering_time", _first_non_empty([p.get("WAVE SOLDERING TIME", ""), _extract_attribute_value(attrs, "wave time", "wave soldering time")]))
+            _set_if_missing("body_mark", _first_non_empty([p.get("BODY MARK", ""), _extract_attribute_value(attrs, "body mark", "marking")]))
+            _set_if_missing("rohs", _extract_attribute_value(attrs, "rohs", "rohs status"))
             pricing_rows = payload.get("pricing", []) if isinstance(payload, dict) else []
-            unified["price_details"] = unified["price_details"] or _extract_price_summary(pricing_rows)
+            _set_if_missing("price_details", _extract_price_summary(pricing_rows))
             if not str(unified["datasheet_url"]).strip():
                 docs = payload.get("documents", []) if isinstance(payload, dict) else []
                 if isinstance(docs, list):
@@ -2107,12 +2134,12 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                         client_id=digikey_id.strip(),
                         client_secret=digikey_secret.strip(),
                         scope=digikey_scope.strip() or None,
-                        site="IN",
-                        currency="INR",
+                        site="US",
+                        currency="USD",
                     )
                     if pb.get("parts"):
                         payloads.append(pb)
-                        sources.append("Source B")
+                        sources.append(SOURCE_DIGIKEY)
                         if isinstance(pb["parts"][0], dict) and _coverage_score(pb["parts"][0]) > _coverage_score(best_part):
                             best_part = pb["parts"][0]
                 except Exception:
@@ -2122,7 +2149,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                     pa = fetch_mouser_part_data(one_mpn, mouser_key.strip())
                     if pa.get("parts"):
                         payloads.append(pa)
-                        sources.append("Source A")
+                        sources.append(SOURCE_MOUSER)
                         if isinstance(pa["parts"][0], dict) and _coverage_score(pa["parts"][0]) > _coverage_score(best_part):
                             best_part = pa["parts"][0]
                 except Exception:
@@ -2136,7 +2163,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                     )
                     if pn.get("parts"):
                         payloads.append(pn)
-                        sources.append("Nexar")
+                        sources.append(SOURCE_NEXAR)
                         if isinstance(pn["parts"][0], dict) and _coverage_score(pn["parts"][0]) > _coverage_score(best_part):
                             best_part = pn["parts"][0]
                 except Exception:
@@ -2156,7 +2183,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
             part0 = (p.get("parts") or [{}])[0] if isinstance(p, dict) else {}
             if isinstance(part0, dict):
                 for k, v in part0.items():
-                    if not str(merged_part.get(k, "")).strip() and str(v).strip():
+                    if _is_effectively_empty(merged_part.get(k, "")) and not _is_effectively_empty(v):
                         merged_part[k] = v
             merged_pricing.extend(p.get("pricing", []) if isinstance(p.get("pricing", []), list) else [])
             merged_attrs.extend(p.get("attributes", []) if isinstance(p.get("attributes", []), list) else [])
@@ -2523,6 +2550,26 @@ with ui_tabs[0]:
             conn,
         )
     st.markdown("#### Queue Status")
+    q_col1, q_col2, q_col3 = st.columns(3)
+    done_count = int(qstats.loc[qstats["status"].astype(str).str.lower() == "done", "cnt"].sum()) if not qstats.empty else 0
+    in_progress_count = int(qstats.loc[qstats["status"].astype(str).str.lower().isin(["running", "in_progress", "processing"]), "cnt"].sum()) if not qstats.empty else 0
+    pending_count = int(qstats.loc[qstats["status"].astype(str).str.lower().isin(["pending", "queued"]), "cnt"].sum()) if not qstats.empty else 0
+    q_col1.metric("✅ Done", done_count)
+    q_col2.metric("🔄 In Progress", in_progress_count)
+    q_col3.metric("🕒 Pending", pending_count)
+    auto_queue_refresh = st.toggle("Auto-refresh queue monitor", value=True, key="queue_auto_refresh_toggle")
+    refresh_seconds = int(st.number_input("Queue refresh seconds", min_value=3, max_value=60, value=8, step=1, key="queue_refresh_seconds"))
+    if auto_queue_refresh:
+        components.html(
+            f"""
+            <script>
+                setTimeout(function() {{
+                    window.parent.location.reload();
+                }}, {refresh_seconds * 1000});
+            </script>
+            """,
+            height=0,
+        )
     if not qstats.empty:
         st.dataframe(qstats, width="stretch", hide_index=True)
     if not qstate.empty:
@@ -2642,10 +2689,10 @@ with ui_tabs[2]:
             type="password",
             key="pending_nexar_secret",
         )
-        pending_split_mode = st.toggle("Fast split mode (Round-robin first hit: Mouser → Digi-Key → Octopart)", value=False, key="pending_split_mode")
+        pending_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Octopart → Mouser)", value=False, key="pending_split_mode")
         pending_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="pending_fill_empty")
         st.write("Pending MPNs:", st.session_state.get("pending_mpns", []))
-        if st.button("▶ Fetch Pending MPNs (Digi-Key → Mouser → Octopart)", key="fetch_pending_mpns"):
+        if st.button("▶ Fetch Pending MPNs (Digi-Key → Octopart → Mouser)", key="fetch_pending_mpns"):
             pending = st.session_state.get("pending_mpns", [])
             if not pending:
                 st.info("Pending list is empty.")
@@ -2951,37 +2998,37 @@ with ui_tabs[4]:
     st.subheader("🏆 Live Price Comparison")
     c1, c2 = st.columns(2)
     cmp_source_a_key = c1.text_input(
-        "Source A API Key",
+        f"{SOURCE_MOUSER} API Key",
         value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK),
         type="password",
         key="cmp_source_a_key",
     )
     cmp_source_b_id = c2.text_input(
-        "Source B Client ID",
+        f"{SOURCE_DIGIKEY} Client ID",
         value=os.getenv("DIGIKEY_CLIENT_ID", DIGIKEY_CLIENT_ID_FALLBACK),
         key="cmp_source_b_id",
     )
     cmp_source_b_secret = c2.text_input(
-        "Source B Client Secret",
+        f"{SOURCE_DIGIKEY} Client Secret",
         value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK),
         type="password",
         key="cmp_source_b_secret",
     )
     cmp_scope = c2.text_input(
-        "Source B Scope",
+        f"{SOURCE_DIGIKEY} Scope",
         value=os.getenv("DIGIKEY_SCOPE", ""),
         key="cmp_source_b_scope",
     )
-    cmp_sandbox = c2.toggle("Use Source B Sandbox", value=False, key="cmp_source_b_sandbox")
+    cmp_sandbox = c2.toggle(f"Use {SOURCE_DIGIKEY} Sandbox", value=False, key="cmp_source_b_sandbox")
     cmp_mpn = st.text_input("Enter MPN", key="cmp_mpn")
 
     if st.button("Compare Price", key="compare_price_btn"):
         if not cmp_mpn.strip():
             st.error("Enter MPN")
         elif not cmp_source_a_key.strip():
-            st.error("Enter Source A API Key")
+            st.error(f"Enter {SOURCE_MOUSER} API Key")
         elif not cmp_source_b_id.strip() or not cmp_source_b_secret.strip():
-            st.error("Enter Source B credentials")
+            st.error(f"Enter {SOURCE_DIGIKEY} credentials")
         else:
             comparison = compare_suppliers_price(
                 cmp_mpn.strip(),
