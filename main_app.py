@@ -107,6 +107,31 @@ def _extract_price_summary(pricing_rows):
     return ""
 
 
+def _extract_component_thickness(attributes):
+    if not isinstance(attributes, list):
+        return ""
+    primary = _extract_attribute_value(
+        attributes,
+        "height",
+        "height seated",
+        "seated height",
+        "maximum height",
+        "max height",
+        "package height",
+        "component thickness",
+        "thickness",
+    )
+    if primary:
+        return primary
+    # Fallback: Size / Dimension fields sometimes encode L x W x H.
+    size_txt = _extract_attribute_value(attributes, "size / dimension", "size", "dimensions")
+    if size_txt and "x" in str(size_txt).lower():
+        parts = [p.strip() for p in re.split(r"[xX×]", str(size_txt)) if p.strip()]
+        if len(parts) >= 3:
+            return parts[-1]
+    return ""
+
+
 def normalize_mpn(value):
     txt = str(value or "").strip()
     if not txt:
@@ -137,19 +162,7 @@ def add_enrichment_fields(parts, attributes, pricing):
     operating_temp = _extract_attribute_value(attributes, "operating temperature", "temperature range", "operating temp")
     lsl = _extract_attribute_value(attributes, "lsl", "land side", "lead surface")
     package = _extract_attribute_value(attributes, "package", "case", "mounting package")
-    component_thickness = _extract_attribute_value(
-        attributes,
-        "component thickness",
-        "thickness",
-        "height",
-        "maximum height",
-        "max height",
-        "package height",
-        "seating height",
-        "size / dimension",
-        "size",
-        "length",
-    )
+    component_thickness = _extract_component_thickness(attributes)
     reach = _extract_attribute_value(attributes, "reach")
     reflow_time = _extract_attribute_value(attributes, "reflow soldering time", "reflow time", "time at reflow")
     wave_time = _extract_attribute_value(attributes, "wave soldering time", "wave time")
@@ -1336,7 +1349,7 @@ def upsert_unified_part_for_mpn(mpn):
             _set_if_missing("package_details", _first_non_empty([p.get("PACKAGE", ""), _extract_attribute_value(attrs, "package", "case", "mount")]))
             _set_if_missing("price_details", _first_non_empty([p.get("PRICE DETAILS", ""), _extract_price_summary(payload.get("pricing", []) if isinstance(payload, dict) else [])]))
             _set_if_missing("operating_temperature", _first_non_empty([p.get("OPERATING TEMPERATURE", ""), _extract_attribute_value(attrs, "operating temperature", "temperature range", "operating temp")]))
-            _set_if_missing("component_thickness", _first_non_empty([p.get("COMPONENT THICKNESS", ""), _extract_attribute_value(attrs, "component thickness", "thickness", "height", "maximum height", "max height", "package height", "seating height", "size / dimension", "size", "length")]))
+            _set_if_missing("component_thickness", _first_non_empty([p.get("COMPONENT THICKNESS", ""), _extract_component_thickness(attrs)]))
             _set_if_missing("reach", _first_non_empty([p.get("REACH", ""), _extract_attribute_value(attrs, "reach", "reach compliance", "compliance")]))
             if not str(unified["reach"]).strip():
                 reach_candidates = []
