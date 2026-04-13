@@ -2529,15 +2529,11 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 )
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
-                    "UPDATE scrub_queue SET status='done', source=?, last_error='', updated_at_utc=? WHERE mpn=?",
-                    (source or save_status, datetime.now(timezone.utc).isoformat(), mpn),
+                    "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
+                    (err, datetime.now(timezone.utc).isoformat(), mpn),
                 )
                 conn.execute(
-                    """
-                    UPDATE scrub_queue_state
-                    SET last_mpn=?, last_status='done', processed_count=processed_count+1, updated_at_utc=?
-                    WHERE id=1
-                    """,
+                    "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
                     (mpn, datetime.now(timezone.utc).isoformat()),
                 )
                 conn.commit()
