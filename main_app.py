@@ -8,6 +8,7 @@ import re
 import os
 import json
 import difflib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import requests
 from pathlib import Path
@@ -41,7 +42,6 @@ TABS = [
 DEV_INFO = "Developed by :- Shashank C | Mail ID:- shashank.c@kaynestechnology.net"
 SOURCE_MOUSER = "Mouser"
 SOURCE_DIGIKEY = "Digi-Key"
-SOURCE_NEXAR = "Octopart/Nexar"
 # Prefer environment variables first, then built-in defaults so manual entry is not required each run.
 MOUSER_API_KEY_FALLBACK = os.getenv("MOUSER_API_KEY", "a5d0cdf4-c5b6-4600-88ab-12290f19e2cc")
 DIGIKEY_CLIENT_ID_FALLBACK = os.getenv("DIGIKEY_CLIENT_ID", "AyNFvUvmDoGUTtIyeDAhqE1BsHzQ9HNlMM2CoKurruURHJPl")
@@ -536,6 +536,20 @@ def fetch_digikey_part_data(
     timeout=30,
     scope=None,
 ):
+    def _keyword_candidates(raw_part):
+        raw = str(raw_part or "").strip()
+        cands = [raw]
+        compact = raw.replace(" ", "")
+        if compact not in cands:
+            cands.append(compact)
+        alnum = re.sub(r"[^A-Za-z0-9]", "", raw)
+        if alnum and alnum not in cands:
+            cands.append(alnum)
+        lz = raw.lstrip("0")
+        if lz and lz not in cands:
+            cands.append(lz)
+        return [c for c in cands if c]
+
     def _norm_mpn(value):
         return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
 
@@ -626,31 +640,34 @@ def fetch_digikey_part_data(
 
         # 2) Keyword fallback (more tolerant for MPN formats)
         keyword_url = f"https://{host}/products/v4/search/keyword"
-        keyword_payload = {
-            "Keywords": str(part_number).strip(),
-            "RecordCount": 1,
-        }
-        keyword_req = request.Request(
-            url=keyword_url,
-            data=json.dumps(keyword_payload).encode("utf-8"),
-            headers={**common_headers, "Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with request.urlopen(keyword_req, timeout=timeout) as resp:
-                key_data = json.loads(resp.read().decode("utf-8") or "{}")
-            products = key_data.get("Products", []) if isinstance(key_data, dict) else []
-            picked = _pick_best_digikey_product(products, part_number)
-            if picked:
-                product = picked
-                break
-        except HTTPError as e:
-            detail = ""
+        for kw in _keyword_candidates(part_number):
+            keyword_payload = {
+                "Keywords": kw,
+                "RecordCount": 25,
+            }
+            keyword_req = request.Request(
+                url=keyword_url,
+                data=json.dumps(keyword_payload).encode("utf-8"),
+                headers={**common_headers, "Content-Type": "application/json"},
+                method="POST",
+            )
             try:
-                detail = e.read().decode("utf-8")
-            except Exception:
-                detail = str(e)
-            keyword_errors.append(f"{one_site}/{one_currency}: {e.code} {detail[:140]}")
+                with request.urlopen(keyword_req, timeout=timeout) as resp:
+                    key_data = json.loads(resp.read().decode("utf-8") or "{}")
+                products = key_data.get("Products", []) if isinstance(key_data, dict) else []
+                picked = _pick_best_digikey_product(products, part_number)
+                if picked:
+                    product = picked
+                    break
+            except HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8")
+                except Exception:
+                    detail = str(e)
+                keyword_errors.append(f"{one_site}/{one_currency}/{kw}: {e.code} {detail[:120]}")
+        if product:
+            break
 
     if not product and keyword_errors:
         raise RuntimeError(f"{SOURCE_DIGIKEY} keyword error: {' | '.join(keyword_errors[:3])}")
@@ -1306,10 +1323,8 @@ def upsert_unified_part_for_mpn(mpn):
         source_priority = {
             SOURCE_DIGIKEY: 1,
             "Source B": 1,
-            SOURCE_NEXAR: 2,
-            "Nexar": 2,
-            SOURCE_MOUSER: 3,
-            "Source A": 3,
+            SOURCE_MOUSER: 2,
+            "Source A": 2,
         }
         if not live_df.empty:
             live_df["priority"] = live_df["selected_source"].map(source_priority).fillna(99)
@@ -1548,7 +1563,7 @@ def fetch_digikey_data(mpn, digikey_id, digikey_secret, digikey_scope=None, digi
         )
         host = "sandbox-api.digikey.com" if digikey_sandbox else "api.digikey.com"
         url = f"https://{host}/products/v4/search/keyword"
-        payload = {"Keywords": str(mpn).strip(), "RecordCount": 1}
+        payload = {"Keywords": str(mpn).strip(), "RecordCount": 25}
         req = request.Request(
             url=url,
             data=json.dumps(payload).encode("utf-8"),
@@ -2073,7 +2088,7 @@ def build_z2_spec_cache_for_mpn(mpn):
         conn.commit()
 
 
-def save_live_payload_to_cells(mpn, payload, section_name="Live Combo", title="Digi-Key + Mouser + Octopart"):
+def save_live_payload_to_cells(mpn, payload, section_name="Live Combo", title="Digi-Key + Mouser"):
     mpn = str(mpn).strip()
     if not mpn or not isinstance(payload, dict):
         return
@@ -2160,20 +2175,31 @@ def save_live_payload_to_cells(mpn, payload, section_name="Live Combo", title="D
 
 
 def _rotating_priority_for_index(idx, split_mode=False):
-    default_order = ["digikey", "octopart", "mouser"]
+    default_order = ["digikey", "mouser"]
     if not split_mode:
         return default_order
-    rr_base = ["digikey", "octopart", "mouser"]
+    rr_base = ["digikey", "mouser"]
     start = int(idx) % len(rr_base)
     return rr_base[start:] + rr_base[:start]
 
 
-def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", nexar_id="", nexar_secret="", priority_order=None, save_to_cells=False, fill_empty_from_fallback=True):
+def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", priority_order=None, save_to_cells=False, fill_empty_from_fallback=True):
     """
-    For missing scraper MPNs, fetch from live sources (default priority: Digi-Key -> Octopart/Nexar -> Mouser)
+    For missing scraper MPNs, fetch from live sources (default priority: Digi-Key -> Mouser)
     and save into same DB via live_part_cache + unified_part_cache.
     """
     def _merge_payload_for_mpn(one_mpn):
+        def _call_with_retry(callable_fn, max_attempts=3, retry_delay=0.35):
+            last_ex = None
+            for attempt in range(max_attempts):
+                try:
+                    return callable_fn(), ""
+                except Exception as ex:
+                    last_ex = ex
+                    if attempt < max_attempts - 1:
+                        time.sleep(retry_delay)
+            return None, str(last_ex or "unknown error")
+
         def _coverage_score(part_row):
             if not isinstance(part_row, dict):
                 return 0
@@ -2187,57 +2213,69 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
             ]
             return sum(1 for k in keys if str(part_row.get(k, "")).strip())
 
+        payload_by_provider = {}
+        provider_errors = []
+        provider_order = priority_order or ["digikey", "mouser"]
+        best_part = {}
+        provider_name_map = {
+            "digikey": SOURCE_DIGIKEY,
+            "mouser": SOURCE_MOUSER,
+        }
+
+        def _build_provider_task(provider_key):
+            p = str(provider_key).strip().lower()
+            if p == "digikey" and digikey_id.strip() and digikey_secret.strip():
+                return lambda: fetch_digikey_part_data(
+                    one_mpn,
+                    client_id=digikey_id.strip(),
+                    client_secret=digikey_secret.strip(),
+                    scope=digikey_scope.strip() or None,
+                    site="US",
+                    currency="USD",
+                )
+            if p == "mouser" and mouser_key.strip():
+                return lambda: fetch_mouser_part_data(one_mpn, mouser_key.strip())
+            return None
+
+        provider_tasks = {}
+        for provider in provider_order:
+            task = _build_provider_task(provider)
+            if task:
+                provider_tasks[str(provider).strip().lower()] = task
+
+        if provider_tasks:
+            with ThreadPoolExecutor(max_workers=max(1, len(provider_tasks))) as executor:
+                future_map = {
+                    executor.submit(_call_with_retry, task): provider_key
+                    for provider_key, task in provider_tasks.items()
+                }
+                for future in as_completed(future_map):
+                    provider_key = future_map[future]
+                    provider_name = provider_name_map.get(provider_key, provider_key)
+                    try:
+                        payload, err = future.result()
+                    except Exception as ex:
+                        payload, err = None, str(ex)
+                    if payload and isinstance(payload, dict) and payload.get("parts"):
+                        payload_by_provider[provider_key] = payload
+                    elif err:
+                        provider_errors.append(f"{provider_name}: fetch failed")
+                    else:
+                        provider_errors.append(f"{provider_name}: no match")
+
         payloads = []
         sources = []
-        provider_errors = []
-        provider_order = priority_order or ["digikey", "octopart", "mouser"]
-        best_part = {}
         for provider in provider_order:
             p = str(provider).strip().lower()
-            if p == "digikey" and digikey_id.strip() and digikey_secret.strip():
-                try:
-                    pb = fetch_digikey_part_data(
-                        one_mpn,
-                        client_id=digikey_id.strip(),
-                        client_secret=digikey_secret.strip(),
-                        scope=digikey_scope.strip() or None,
-                        site="US",
-                        currency="USD",
-                    )
-                    if pb.get("parts"):
-                        payloads.append(pb)
-                        sources.append(SOURCE_DIGIKEY)
-                        if isinstance(pb["parts"][0], dict) and _coverage_score(pb["parts"][0]) > _coverage_score(best_part):
-                            best_part = pb["parts"][0]
-                except Exception:
-                    provider_errors.append(f"{SOURCE_DIGIKEY}: fetch failed")
-            elif p == "mouser" and mouser_key.strip():
-                try:
-                    pa = fetch_mouser_part_data(one_mpn, mouser_key.strip())
-                    if pa.get("parts"):
-                        payloads.append(pa)
-                        sources.append(SOURCE_MOUSER)
-                        if isinstance(pa["parts"][0], dict) and _coverage_score(pa["parts"][0]) > _coverage_score(best_part):
-                            best_part = pa["parts"][0]
-                except Exception:
-                    provider_errors.append(f"{SOURCE_MOUSER}: fetch failed")
-            elif p in {"nexar", "octopart"} and nexar_id.strip() and nexar_secret.strip():
-                try:
-                    pn = fetch_nexar_part_data(
-                        one_mpn,
-                        client_id=nexar_id.strip(),
-                        client_secret=nexar_secret.strip(),
-                    )
-                    if pn.get("parts"):
-                        payloads.append(pn)
-                        sources.append(SOURCE_NEXAR)
-                        if isinstance(pn["parts"][0], dict) and _coverage_score(pn["parts"][0]) > _coverage_score(best_part):
-                            best_part = pn["parts"][0]
-                except Exception:
-                    provider_errors.append(f"{SOURCE_NEXAR}: fetch failed")
-
-            # In fallback mode, continue across providers to maximize field coverage.
-            # Fast-stop only when fallback fill is disabled.
+            payload = payload_by_provider.get(p)
+            if not payload:
+                continue
+            payloads.append(payload)
+            provider_name = provider_name_map.get(p, p)
+            sources.append(provider_name)
+            part0 = (payload.get("parts") or [{}])[0] if isinstance(payload, dict) else {}
+            if isinstance(part0, dict) and _coverage_score(part0) > _coverage_score(best_part):
+                best_part = part0
             if payloads and not fill_empty_from_fallback:
                 break
 
@@ -2335,7 +2373,7 @@ def enqueue_scrub_queue_from_upload(file_obj):
     return {"queued": queued, "skipped": skipped, "error": ""}
 
 
-def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", nexar_id="", nexar_secret="", fill_empty_from_fallback=True):
+def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True):
     ensure_scrub_queue_tables()
     batch_size = max(1, int(batch_size or 1))
     now_utc = datetime.now(timezone.utc).isoformat()
@@ -2359,8 +2397,6 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 digikey_id=digikey_id,
                 digikey_secret=digikey_secret,
                 digikey_scope=digikey_scope,
-                nexar_id=nexar_id,
-                nexar_secret=nexar_secret,
                 priority_order=_rotating_priority_for_index(i - 1, split_mode=False),
                 save_to_cells=True,
                 fill_empty_from_fallback=fill_empty_from_fallback,
@@ -2420,7 +2456,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
     return processed
 
 
-def routine_check_db_mpns(limit, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", nexar_id="", nexar_secret="", fill_empty_from_fallback=True):
+def routine_check_db_mpns(limit, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True):
     ensure_unified_parts_table()
     mpns = get_available_db_mpns()
     if limit and int(limit) > 0:
@@ -2433,8 +2469,6 @@ def routine_check_db_mpns(limit, mouser_key="", digikey_id="", digikey_secret=""
             digikey_id=digikey_id,
             digikey_secret=digikey_secret,
             digikey_scope=digikey_scope,
-            nexar_id=nexar_id,
-            nexar_secret=nexar_secret,
             priority_order=_rotating_priority_for_index(i - 1, split_mode=False),
             save_to_cells=True,
             fill_empty_from_fallback=fill_empty_from_fallback,
@@ -2505,7 +2539,7 @@ with ui_tabs[0]:
 
     st.markdown("---")
     st.subheader("Live Combo Scraper → DB Cells")
-    st.caption("Priority used: Digi-Key → Octopart/Nexar → Mouser. Results are written directly to DB cells.")
+    st.caption("Priority used: Digi-Key → Mouser. Results are written directly to DB cells.")
     live_up = st.file_uploader("Upload MPN List for Live Combo Scraper", type=["xlsx", "csv"], key="live_combo_upload")
     live_manual = st.text_area("Or enter MPNs (comma/newline separated)", key="live_combo_manual")
     lc1, lc2 = st.columns(2)
@@ -2513,9 +2547,7 @@ with ui_tabs[0]:
     live_dk_secret = lc1.text_input("Digi-Key Client Secret", value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK), type="password", key="live_combo_dk_secret")
     live_dk_scope = lc1.text_input("Digi-Key Scope (Optional)", value=os.getenv("DIGIKEY_SCOPE", ""), key="live_combo_dk_scope")
     live_mouser = lc2.text_input("Mouser API Key (Optional)", value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK), type="password", key="live_combo_mouser")
-    live_nexar_id = lc2.text_input("Octopart/Nexar Client ID (Optional)", value=NEXAR_CLIENT_ID_FALLBACK, key="live_combo_nexar_id")
-    live_nexar_secret = lc2.text_input("Octopart/Nexar Client Secret (Optional)", value=NEXAR_CLIENT_SECRET_FALLBACK, type="password", key="live_combo_nexar_secret")
-    live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Octopart → Mouser)", value=False, key="live_combo_split_mode")
+    live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Mouser)", value=False, key="live_combo_split_mode")
     live_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="live_combo_fill_empty")
     if st.button("Start Live Combo Scraper", key="live_combo_run"):
         live_mpns = []
@@ -2539,8 +2571,6 @@ with ui_tabs[0]:
                         digikey_id=live_dk_id,
                         digikey_secret=live_dk_secret,
                         digikey_scope=live_dk_scope,
-                        nexar_id=live_nexar_id,
-                        nexar_secret=live_nexar_secret,
                         priority_order=_rotating_priority_for_index(i - 1, split_mode=live_split_mode),
                         save_to_cells=True,
                         fill_empty_from_fallback=live_fill_empty,
@@ -2559,8 +2589,6 @@ with ui_tabs[0]:
     bg_dk_id = bgc1.text_input("Queue Digi-Key Client ID", value=os.getenv("DIGIKEY_CLIENT_ID", DIGIKEY_CLIENT_ID_FALLBACK), key="bg_dk_id")
     bg_dk_secret = bgc1.text_input("Queue Digi-Key Client Secret", value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK), type="password", key="bg_dk_secret")
     bg_dk_scope = bgc1.text_input("Queue Digi-Key Scope", value=os.getenv("DIGIKEY_SCOPE", ""), key="bg_dk_scope")
-    bg_nexar_id = bgc2.text_input("Queue Octopart/Nexar Client ID", value=NEXAR_CLIENT_ID_FALLBACK, key="bg_nexar_id")
-    bg_nexar_secret = bgc2.text_input("Queue Octopart/Nexar Client Secret", value=NEXAR_CLIENT_SECRET_FALLBACK, type="password", key="bg_nexar_secret")
     bg_fill_empty = bgc2.toggle("Queue fallback fill empty fields", value=True, key="bg_fill_empty")
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
 
@@ -2581,8 +2609,6 @@ with ui_tabs[0]:
                     digikey_id=bg_dk_id,
                     digikey_secret=bg_dk_secret,
                     digikey_scope=bg_dk_scope,
-                    nexar_id=bg_nexar_id,
-                    nexar_secret=bg_nexar_secret,
                     fill_empty_from_fallback=bg_fill_empty,
                 )
                 if processed:
@@ -2598,8 +2624,6 @@ with ui_tabs[0]:
             digikey_id=bg_dk_id,
             digikey_secret=bg_dk_secret,
             digikey_scope=bg_dk_scope,
-            nexar_id=bg_nexar_id,
-            nexar_secret=bg_nexar_secret,
             fill_empty_from_fallback=bg_fill_empty,
         )
         if not processed:
@@ -2683,8 +2707,6 @@ with ui_tabs[1]:
     rc_dk_id = rc1.text_input("Routine Digi-Key Client ID (Optional)", value=os.getenv("DIGIKEY_CLIENT_ID", DIGIKEY_CLIENT_ID_FALLBACK), key="routine_dk_id")
     rc_dk_secret = rc1.text_input("Routine Digi-Key Client Secret (Optional)", value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK), type="password", key="routine_dk_secret")
     rc_dk_scope = rc1.text_input("Routine Digi-Key Scope (Optional)", value=os.getenv("DIGIKEY_SCOPE", ""), key="routine_dk_scope")
-    rc_nexar_id = rc2.text_input("Routine Nexar ID (Optional)", value=NEXAR_CLIENT_ID_FALLBACK, key="routine_nexar_id")
-    rc_nexar_secret = rc2.text_input("Routine Nexar Secret (Optional)", value=NEXAR_CLIENT_SECRET_FALLBACK, type="password", key="routine_nexar_secret")
     rc_fill = rc2.toggle("Routine fallback fill empty fields", value=True, key="routine_fill_empty")
     rc_limit = st.number_input("Routine MPN limit from DB", min_value=1, max_value=50000, value=200, step=50, key="routine_limit")
     if st.button("🔄 Run Routine Check Now", key="routine_check_run_btn"):
@@ -2694,8 +2716,6 @@ with ui_tabs[1]:
             digikey_id=rc_dk_id,
             digikey_secret=rc_dk_secret,
             digikey_scope=rc_dk_scope,
-            nexar_id=rc_nexar_id,
-            nexar_secret=rc_nexar_secret,
             fill_empty_from_fallback=rc_fill,
         )
         st.success(f"Routine check completed for {len(routine_results)} MPN(s).")
@@ -2732,21 +2752,10 @@ with ui_tabs[2]:
             value=os.getenv("DIGIKEY_SCOPE", ""),
             key="pending_digikey_scope",
         )
-        pending_nexar_id = p1.text_input(
-            "Nexar/Octopart Client ID (Optional)",
-            value=NEXAR_CLIENT_ID_FALLBACK,
-            key="pending_nexar_id",
-        )
-        pending_nexar_secret = p1.text_input(
-            "Nexar/Octopart Client Secret (Optional)",
-            value=NEXAR_CLIENT_SECRET_FALLBACK,
-            type="password",
-            key="pending_nexar_secret",
-        )
-        pending_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Octopart → Mouser)", value=False, key="pending_split_mode")
+        pending_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Mouser)", value=False, key="pending_split_mode")
         pending_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="pending_fill_empty")
         st.write("Pending MPNs:", st.session_state.get("pending_mpns", []))
-        if st.button("▶ Fetch Pending MPNs (Digi-Key → Octopart → Mouser)", key="fetch_pending_mpns"):
+        if st.button("▶ Fetch Pending MPNs (Digi-Key → Mouser)", key="fetch_pending_mpns"):
             pending = st.session_state.get("pending_mpns", [])
             if not pending:
                 st.info("Pending list is empty.")
@@ -2764,8 +2773,6 @@ with ui_tabs[2]:
                             digikey_id=pending_digikey_id,
                             digikey_secret=pending_digikey_secret,
                             digikey_scope=pending_digikey_scope,
-                            nexar_id=pending_nexar_id,
-                            nexar_secret=pending_nexar_secret,
                             priority_order=_rotating_priority_for_index(i - 1, split_mode=pending_split_mode),
                             save_to_cells=True,
                             fill_empty_from_fallback=pending_fill_empty,
