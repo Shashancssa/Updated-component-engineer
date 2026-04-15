@@ -57,12 +57,13 @@ DEFAULT_MOUSER_DAILY_LIMIT = int(os.getenv("MOUSER_DAILY_LIMIT", "5000") or 5000
 DEFAULT_DIGIKEY_DAILY_LIMIT = int(os.getenv("DIGIKEY_DAILY_LIMIT", "1000") or 1000)
 DEFAULT_MOUSER_MIN_INTERVAL_SEC = float(os.getenv("MOUSER_MIN_INTERVAL_SEC", "1.0") or 1.0)
 DEFAULT_DIGIKEY_MIN_INTERVAL_SEC = float(os.getenv("DIGIKEY_MIN_INTERVAL_SEC", "0.6") or 0.6)
+SQLITE_QUEUE_SERIAL_MODE = str(os.getenv("SQLITE_QUEUE_SERIAL_MODE", "1")).strip().lower() not in {"0", "false", "no"}
 
 st.set_page_config(layout="wide", page_title="COMPONENT ENGINEER DATABASE", page_icon="🛡️")
 
 
 def ensure_api_usage_table():
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS api_usage_daily (
@@ -2276,12 +2277,25 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
     """
     def _merge_payload_for_mpn(one_mpn):
         def _call_with_retry(callable_fn, max_attempts=3, retry_delay=0.35):
+            def _is_non_retryable(msg):
+                m = str(msg or "").lower()
+                return any(x in m for x in [
+                    "daily api limit reached",
+                    "401",
+                    "403",
+                    "429",
+                    "invalid client",
+                    "forbidden",
+                    "not authorized",
+                ])
             last_ex = None
             for attempt in range(max_attempts):
                 try:
                     return callable_fn(), ""
                 except Exception as ex:
                     last_ex = ex
+                    if _is_non_retryable(str(ex)):
+                        break
                     if attempt < max_attempts - 1:
                         time.sleep(retry_delay)
             return None, str(last_ex or "unknown error")
@@ -2369,7 +2383,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                     if payload and isinstance(payload, dict) and payload.get("parts"):
                         payload_by_provider[provider_key] = payload
                     elif err:
-                        provider_errors.append(f"{provider_name}: fetch failed")
+                        provider_errors.append(f"{provider_name}: {str(err)[:220]}")
                     else:
                         provider_errors.append(f"{provider_name}: no match")
 
@@ -2423,7 +2437,12 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
             save_live_payload_to_cells(mpn, payload)
             build_z2_spec_cache_for_mpn(mpn)
     upsert_unified_part_for_mpn(mpn)
-    return {"mpn": mpn, "source": source, "status": "saved" if payload is not None else "unified_only"}
+    return {
+        "mpn": mpn,
+        "source": source,
+        "status": "saved" if payload is not None else "unified_only",
+        "error": "" if payload is not None else source,
+    }
 
 
 def process_mpns_concurrently(mpns, worker_fn, max_workers=4):
@@ -2520,10 +2539,14 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
         mpns = [str(r[0]).strip() for r in rows if str(r[0]).strip()]
 
     max_workers = max(1, min(int(max_workers or 1), 16))
+    if SQLITE_QUEUE_SERIAL_MODE:
+        # SQLite allows only one writer at a time. Force serialized queue workers by default
+        # to prevent "sqlite3.OperationalError: database is locked" during heavy bulk runs.
+        max_workers = 1
     future_map = {}
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         for i, mpn in enumerate(mpns, start=1):
-            with sqlite3.connect(DB_PATH) as conn:
+            with sqlite3.connect(DB_PATH, timeout=30) as conn:
                 conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, mpn))
                 conn.commit()
             log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Queue item {i}/{len(mpns)} started.")
@@ -2555,7 +2578,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 continue
             if str(out.get("status", "")).strip().lower() == "error":
                 err = str(out.get("error", "Unknown queue error"))
-                with sqlite3.connect(DB_PATH) as conn:
+                with sqlite3.connect(DB_PATH, timeout=30) as conn:
                     conn.execute(
                         "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
                         (err, datetime.now(timezone.utc).isoformat(), mpn),
@@ -2571,9 +2594,10 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
 
             source = str(out.get("source", "")).strip()
             save_status = str(out.get("status", "")).strip()
+            err_msg = str(out.get("error", "")).strip()
             if save_status not in ("saved", "unified_only"):
                 err = f"No DB save completed (status={save_status or 'unknown'})."
-                with sqlite3.connect(DB_PATH) as conn:
+                with sqlite3.connect(DB_PATH, timeout=30) as conn:
                     conn.execute(
                         "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
                         (err, datetime.now(timezone.utc).isoformat(), mpn),
@@ -2588,14 +2612,28 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 continue
 
             if save_status == "unified_only":
+                warn_msg = err_msg or source or "No live payload found from providers."
                 log_scrub_history(
                     mpn,
                     step="fetch_warning",
                     status="warning",
                     source=source,
-                    message="No live payload found; only unified cache was refreshed.",
+                    message=f"No live payload found; only unified cache was refreshed. Reason: {warn_msg}",
                 )
-            with sqlite3.connect(DB_PATH) as conn:
+                with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                    conn.execute(
+                        "UPDATE scrub_queue SET status='error', source=?, last_error=?, updated_at_utc=? WHERE mpn=?",
+                        (source or save_status, warn_msg, datetime.now(timezone.utc).isoformat(), mpn),
+                    )
+                    conn.execute(
+                        "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
+                        (mpn, datetime.now(timezone.utc).isoformat()),
+                    )
+                    conn.commit()
+                processed.append({"mpn": mpn, "status": "error", "source": source or save_status, "error": warn_msg})
+                continue
+
+            with sqlite3.connect(DB_PATH, timeout=30) as conn:
                 conn.execute(
                     "UPDATE scrub_queue SET status='done', source=?, last_error='', updated_at_utc=? WHERE mpn=?",
                     (source or save_status, datetime.now(timezone.utc).isoformat(), mpn),
@@ -2849,6 +2887,8 @@ with ui_tabs[0]:
     bg_dk_scope = bgc1.text_input("Queue Digi-Key Scope", value=os.getenv("DIGIKEY_SCOPE", ""), key="bg_dk_scope")
     bg_fill_empty = bgc2.toggle("Queue fallback fill empty fields", value=True, key="bg_fill_empty")
     bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=16, value=4, step=1, key="bg_workers")
+    if SQLITE_QUEUE_SERIAL_MODE:
+        st.caption("SQLite safe mode is ON: queue writes are serialized (effective workers = 1) to avoid database lock errors.")
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
 
     bg_file = st.file_uploader("Upload full MPN file (col1=MPN, col2=Manufacturer/Make optional)", type=["xlsx", "csv"], key="bg_queue_upload")
