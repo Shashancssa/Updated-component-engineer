@@ -50,8 +50,74 @@ DIGIKEY_CLIENT_SECRET_FALLBACK = os.getenv("DIGIKEY_CLIENT_SECRET", "k5bDnbn49OF
 NEXAR_CLIENT_ID_FALLBACK = os.getenv("NEXAR_CLIENT_ID", "2000628d-be02-44fc-bfff-f7a90ad13926")
 NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "ECZ622yjXXrCVDpXOmgJHrulfQI3AWJh_sz0")
 _DIGIKEY_TOKEN_CACHE = {}
+_API_LIMIT_LOCK = threading.Lock()
+_API_LAST_CALL_TS = {}
+
+DEFAULT_MOUSER_DAILY_LIMIT = int(os.getenv("MOUSER_DAILY_LIMIT", "5000") or 5000)
+DEFAULT_DIGIKEY_DAILY_LIMIT = int(os.getenv("DIGIKEY_DAILY_LIMIT", "1000") or 1000)
+DEFAULT_MOUSER_MIN_INTERVAL_SEC = float(os.getenv("MOUSER_MIN_INTERVAL_SEC", "1.0") or 1.0)
+DEFAULT_DIGIKEY_MIN_INTERVAL_SEC = float(os.getenv("DIGIKEY_MIN_INTERVAL_SEC", "0.6") or 0.6)
 
 st.set_page_config(layout="wide", page_title="COMPONENT ENGINEER DATABASE", page_icon="🛡️")
+
+
+def ensure_api_usage_table():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_usage_daily (
+                provider TEXT NOT NULL,
+                usage_date_utc TEXT NOT NULL,
+                call_count INTEGER NOT NULL DEFAULT 0,
+                updated_at_utc TEXT,
+                PRIMARY KEY (provider, usage_date_utc)
+            )
+            """
+        )
+        conn.commit()
+
+
+def _enforce_api_policy(provider_key):
+    provider = str(provider_key or "").strip().lower()
+    if provider not in {"mouser", "digikey"}:
+        return
+
+    daily_limit = DEFAULT_MOUSER_DAILY_LIMIT if provider == "mouser" else DEFAULT_DIGIKEY_DAILY_LIMIT
+    min_interval = DEFAULT_MOUSER_MIN_INTERVAL_SEC if provider == "mouser" else DEFAULT_DIGIKEY_MIN_INTERVAL_SEC
+    usage_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    with _API_LIMIT_LOCK:
+        ensure_api_usage_table()
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT call_count FROM api_usage_daily WHERE provider=? AND usage_date_utc=?",
+                (provider, usage_date),
+            ).fetchone()
+            used = int(row[0]) if row else 0
+            if used >= int(daily_limit):
+                raise RuntimeError(
+                    f"{provider.title()} daily API limit reached ({used}/{daily_limit}) for UTC date {usage_date}. "
+                    "Resume after UTC day reset or increase limit via environment settings."
+                )
+
+            now_ts = time.time()
+            last_ts = float(_API_LAST_CALL_TS.get(provider, 0.0) or 0.0)
+            wait_s = float(min_interval) - (now_ts - last_ts)
+            if wait_s > 0:
+                time.sleep(wait_s)
+
+            conn.execute(
+                """
+                INSERT INTO api_usage_daily (provider, usage_date_utc, call_count, updated_at_utc)
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT(provider, usage_date_utc) DO UPDATE SET
+                    call_count = call_count + 1,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (provider, usage_date, datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+            _API_LAST_CALL_TS[provider] = time.time()
 
 # ==========================================
 # UI COMPONENTS
@@ -344,6 +410,7 @@ def fetch_mouser_part_data(mpn, api_key, timeout=30):
       - attributes (specification rows)
       - documents (datasheet/product links)
     """
+    _enforce_api_policy("mouser")
     safe_api_key = parse.quote(str(api_key).strip())
     url = f"https://api.mouser.com/api/v1/search/partnumber?apiKey={safe_api_key}"
     payload = {
@@ -554,6 +621,7 @@ def fetch_digikey_part_data(
     timeout=30,
     scope=None,
 ):
+    _enforce_api_policy("digikey")
     def _keyword_candidates(raw_part):
         raw = str(raw_part or "").strip()
         cands = [raw]
@@ -2208,12 +2276,25 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
     """
     def _merge_payload_for_mpn(one_mpn):
         def _call_with_retry(callable_fn, max_attempts=3, retry_delay=0.35):
+            def _is_non_retryable(msg):
+                m = str(msg or "").lower()
+                return any(x in m for x in [
+                    "daily api limit reached",
+                    "401",
+                    "403",
+                    "429",
+                    "invalid client",
+                    "forbidden",
+                    "not authorized",
+                ])
             last_ex = None
             for attempt in range(max_attempts):
                 try:
                     return callable_fn(), ""
                 except Exception as ex:
                     last_ex = ex
+                    if _is_non_retryable(str(ex)):
+                        break
                     if attempt < max_attempts - 1:
                         time.sleep(retry_delay)
             return None, str(last_ex or "unknown error")
@@ -2301,7 +2382,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                     if payload and isinstance(payload, dict) and payload.get("parts"):
                         payload_by_provider[provider_key] = payload
                     elif err:
-                        provider_errors.append(f"{provider_name}: fetch failed")
+                        provider_errors.append(f"{provider_name}: {str(err)[:220]}")
                     else:
                         provider_errors.append(f"{provider_name}: no match")
 
@@ -2355,7 +2436,12 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
             save_live_payload_to_cells(mpn, payload)
             build_z2_spec_cache_for_mpn(mpn)
     upsert_unified_part_for_mpn(mpn)
-    return {"mpn": mpn, "source": source, "status": "saved" if payload is not None else "unified_only"}
+    return {
+        "mpn": mpn,
+        "source": source,
+        "status": "saved" if payload is not None else "unified_only",
+        "error": "" if payload is not None else source,
+    }
 
 
 def process_mpns_concurrently(mpns, worker_fn, max_workers=4):
@@ -2503,6 +2589,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
 
             source = str(out.get("source", "")).strip()
             save_status = str(out.get("status", "")).strip()
+            err_msg = str(out.get("error", "")).strip()
             if save_status not in ("saved", "unified_only"):
                 err = f"No DB save completed (status={save_status or 'unknown'})."
                 with sqlite3.connect(DB_PATH) as conn:
@@ -2520,20 +2607,34 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 continue
 
             if save_status == "unified_only":
+                warn_msg = err_msg or source or "No live payload found from providers."
                 log_scrub_history(
                     mpn,
                     step="fetch_warning",
                     status="warning",
                     source=source,
-                    message="No live payload found; only unified cache was refreshed.",
+                    message=f"No live payload found; only unified cache was refreshed. Reason: {warn_msg}",
                 )
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute(
+                        "UPDATE scrub_queue SET status='error', source=?, last_error=?, updated_at_utc=? WHERE mpn=?",
+                        (source or save_status, warn_msg, datetime.now(timezone.utc).isoformat(), mpn),
+                    )
+                    conn.execute(
+                        "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
+                        (mpn, datetime.now(timezone.utc).isoformat()),
+                    )
+                    conn.commit()
+                processed.append({"mpn": mpn, "status": "error", "source": source or save_status, "error": warn_msg})
+                continue
+
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
-                    "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
-                    (err, datetime.now(timezone.utc).isoformat(), mpn),
+                    "UPDATE scrub_queue SET status='done', source=?, last_error='', updated_at_utc=? WHERE mpn=?",
+                    (source or save_status, datetime.now(timezone.utc).isoformat(), mpn),
                 )
                 conn.execute(
-                    "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
+                    "UPDATE scrub_queue_state SET last_mpn=?, last_status='done', processed_count=processed_count+1, updated_at_utc=? WHERE id=1",
                     (mpn, datetime.now(timezone.utc).isoformat()),
                 )
                 conn.commit()
@@ -2652,6 +2753,7 @@ ensure_live_cache_table()
 ensure_unified_parts_table()
 ensure_z2_spec_tables()
 ensure_scrub_queue_tables()
+ensure_api_usage_table()
 
 st.title("🛡️ Component Engineer")
 ui_tabs = st.tabs([
@@ -2719,6 +2821,11 @@ with ui_tabs[0]:
     st.markdown("---")
     st.subheader("Live Combo Scraper → DB Cells")
     st.caption("Priority used: Digi-Key → Mouser. Results are written directly to DB cells.")
+    st.caption(
+        f"Built-in API protection: Mouser {DEFAULT_MOUSER_DAILY_LIMIT}/day @ {DEFAULT_MOUSER_MIN_INTERVAL_SEC:.1f}s min gap, "
+        f"Digi-Key {DEFAULT_DIGIKEY_DAILY_LIMIT}/day @ {DEFAULT_DIGIKEY_MIN_INTERVAL_SEC:.1f}s min gap (UTC reset). "
+        "Override via env: MOUSER_DAILY_LIMIT, DIGIKEY_DAILY_LIMIT, MOUSER_MIN_INTERVAL_SEC, DIGIKEY_MIN_INTERVAL_SEC."
+    )
     live_up = st.file_uploader("Upload MPN List for Live Combo Scraper", type=["xlsx", "csv"], key="live_combo_upload")
     live_manual = st.text_area("Or enter MPNs (comma/newline separated)", key="live_combo_manual")
     lc1, lc2 = st.columns(2)
@@ -2765,6 +2872,9 @@ with ui_tabs[0]:
     st.markdown("---")
     st.subheader("Large File Background Queue (Resume Supported)")
     st.caption("For 50k+ rows: upload once, process in batches, stop anytime, and resume from last processed MPN.")
+    st.caption(
+        "Queue also enforces API daily limits and request spacing automatically to avoid provider throttling/temporary blocks."
+    )
     bgc1, bgc2 = st.columns(2)
     bg_mouser = bgc1.text_input("Queue Mouser API Key", value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK), type="password", key="bg_mouser")
     bg_dk_id = bgc1.text_input("Queue Digi-Key Client ID", value=os.getenv("DIGIKEY_CLIENT_ID", DIGIKEY_CLIENT_ID_FALLBACK), key="bg_dk_id")
