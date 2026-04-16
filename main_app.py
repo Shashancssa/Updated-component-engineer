@@ -3,6 +3,7 @@ import streamlit.components.v1 as components
 import pandas as pd
 import sqlite3
 import time
+import base64
 import io
 import re
 import os
@@ -53,9 +54,28 @@ _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
 _API_LAST_CALL_TS = {}
 
-DEFAULT_MOUSER_DAILY_LIMIT = int(os.getenv("MOUSER_DAILY_LIMIT", "5000") or 5000)
+def _is_api_limit_error_message(msg):
+    text = str(msg or "").strip().lower()
+    if not text:
+        return False
+    return any(
+        k in text
+        for k in [
+            "daily api limit reached",
+            "api limit reached",
+            "too many requests",
+            "quota",
+            "perday",
+            "per day",
+            "rate limit",
+            "429",
+        ]
+    )
+
+
+DEFAULT_MOUSER_DAILY_LIMIT = int(os.getenv("MOUSER_DAILY_LIMIT", "20000") or 20000)
 DEFAULT_DIGIKEY_DAILY_LIMIT = int(os.getenv("DIGIKEY_DAILY_LIMIT", "1000") or 1000)
-DEFAULT_MOUSER_MIN_INTERVAL_SEC = float(os.getenv("MOUSER_MIN_INTERVAL_SEC", "1.0") or 1.0)
+DEFAULT_MOUSER_MIN_INTERVAL_SEC = float(os.getenv("MOUSER_MIN_INTERVAL_SEC", "0.6") or 0.6)
 DEFAULT_DIGIKEY_MIN_INTERVAL_SEC = float(os.getenv("DIGIKEY_MIN_INTERVAL_SEC", "0.6") or 0.6)
 SQLITE_QUEUE_SERIAL_MODE = str(os.getenv("SQLITE_QUEUE_SERIAL_MODE", "1")).strip().lower() not in {"0", "false", "no"}
 
@@ -1824,7 +1844,30 @@ def render_live_detail_window(parts_df, pricing_rows, attributes_rows, docs_rows
     """
     Render a z2-like detail window from live supplier data.
     """
-    st.markdown("### 📋 Live Detail Window")
+    logo_data_uri = ""
+    try:
+        if LOGO_PATH.exists():
+            logo_b64 = base64.b64encode(LOGO_PATH.read_bytes()).decode("utf-8")
+            logo_data_uri = f"data:image/png;base64,{logo_b64}"
+    except Exception:
+        logo_data_uri = ""
+
+    if logo_data_uri:
+        st.markdown(
+            f"""
+            <div style="position:relative;border:1px solid #e5e7eb;border-radius:14px;padding:12px;background:#ffffff;overflow:hidden;">
+                <div style="position:absolute;right:18px;top:16px;opacity:0.08;">
+                    <img src="{logo_data_uri}" style="width:260px;" />
+                </div>
+                <div style="position:relative;z-index:2;">
+                    <h3 style="margin:2px 0 0 0;">🛒 Distributor Live Window</h3>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown("### 🛒 Distributor Live Window")
     if parts_df.empty:
         st.info("No part details available to render.")
         return
@@ -1843,7 +1886,7 @@ def render_live_detail_window(parts_df, pricing_rows, attributes_rows, docs_rows
                 for t in tags[:8]
             ]
         )
-        st.markdown("#### Tags")
+        st.markdown("#### Distributor Tags")
         st.markdown(tag_html, unsafe_allow_html=True)
 
     attr_df_all = pd.DataFrame(attributes_rows) if attributes_rows else pd.DataFrame()
@@ -1858,7 +1901,7 @@ def render_live_detail_window(parts_df, pricing_rows, attributes_rows, docs_rows
                 return row.get("Value", "")
         return ""
 
-    c1, c2 = st.columns([2, 1])
+    c1, c2 = st.columns([2.2, 1.3])
     with c1:
         summary_rows = [
             ("Datasheet", first.get("Data Sheet URL", "") or first.get("DataSheet", "")),
@@ -1876,6 +1919,25 @@ def render_live_detail_window(parts_df, pricing_rows, attributes_rows, docs_rows
         ]
         summary_rows = [(k, v) for k, v in summary_rows if str(v).strip()]
         summary_df = pd.DataFrame(summary_rows, columns=["Field", "Value"])
+        top_cards = []
+        for card_key in ["Manufacturer", "Manufacturer Part Number", "Supplier Part Number", "Lifecycle Status", "Stock"]:
+            card_val = str(first.get(card_key, "")).strip()
+            if card_val:
+                top_cards.append((card_key, card_val))
+        if top_cards:
+            card_html = "".join(
+                [
+                    (
+                        "<div style='flex:1;min-width:200px;background:#f6f9ff;border:1px solid #dbe5ff;"
+                        "border-radius:10px;padding:10px 12px;margin:4px;'>"
+                        f"<div style='font-size:12px;color:#6b7280'>{k}</div>"
+                        f"<div style='font-size:14px;font-weight:600;color:#1f2937'>{v}</div>"
+                        "</div>"
+                    )
+                    for k, v in top_cards[:6]
+                ]
+            )
+            st.markdown(f"<div style='display:flex;flex-wrap:wrap;gap:6px;'>{card_html}</div>", unsafe_allow_html=True)
         st.markdown("#### Part Summary")
         st.dataframe(summary_df, width="stretch", hide_index=True)
 
@@ -1887,7 +1949,7 @@ def render_live_detail_window(parts_df, pricing_rows, attributes_rows, docs_rows
             st.dataframe(attr_df, width="stretch", hide_index=True)
 
     with c2:
-        st.markdown("#### Where to Buy")
+        st.markdown("#### Distributor Offers")
         if pricing_rows:
             buy_df = pd.DataFrame(pricing_rows)
             display_rows = []
@@ -1921,6 +1983,10 @@ def render_live_detail_window(parts_df, pricing_rows, attributes_rows, docs_rows
                 )
 
             where_buy_df = pd.DataFrame(display_rows)
+            if not where_buy_df.empty and "Buy Link" in where_buy_df.columns:
+                where_buy_df["Buy Link"] = where_buy_df["Buy Link"].apply(
+                    lambda u: f"[Open Link]({u})" if str(u).strip() else ""
+                )
             st.dataframe(where_buy_df, width="stretch", hide_index=True)
         else:
             st.info("No pricing rows available.")
@@ -2437,10 +2503,11 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
             save_live_payload_to_cells(mpn, payload)
             build_z2_spec_cache_for_mpn(mpn)
     upsert_unified_part_for_mpn(mpn)
+    save_status = "saved" if payload is not None else ("limit_reached" if _is_api_limit_error_message(source) else "unified_only")
     return {
         "mpn": mpn,
         "source": source,
-        "status": "saved" if payload is not None else "unified_only",
+        "status": save_status,
         "error": "" if payload is not None else source,
     }
 
@@ -2544,6 +2611,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
         # to prevent "sqlite3.OperationalError: database is locked" during heavy bulk runs.
         max_workers = 1
     future_map = {}
+    hard_stop = False
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         for i, mpn in enumerate(mpns, start=1):
             with sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -2595,6 +2663,29 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
             source = str(out.get("source", "")).strip()
             save_status = str(out.get("status", "")).strip()
             err_msg = str(out.get("error", "")).strip()
+            if save_status == "limit_reached" or _is_api_limit_error_message(err_msg) or _is_api_limit_error_message(source):
+                stop_reason = err_msg or source or "API limit reached"
+                with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                    conn.execute(
+                        "UPDATE scrub_queue SET status='error', source=?, last_error=?, updated_at_utc=? WHERE mpn=?",
+                        (source or "API_LIMIT", stop_reason, datetime.now(timezone.utc).isoformat(), mpn),
+                    )
+                    conn.execute(
+                        "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
+                        (mpn, datetime.now(timezone.utc).isoformat()),
+                    )
+                    conn.commit()
+                log_scrub_history(
+                    mpn,
+                    step="process_error",
+                    status="error",
+                    source=source or "API_LIMIT",
+                    message=f"Queue stopped due to API limit: {stop_reason}",
+                )
+                processed.append({"mpn": mpn, "status": "limit_reached", "source": source or "API_LIMIT", "error": stop_reason, "stop_all": True})
+                hard_stop = True
+                continue
+
             if save_status not in ("saved", "unified_only"):
                 err = f"No DB save completed (status={save_status or 'unknown'})."
                 with sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -2651,7 +2742,40 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 message="Queue item completed and status updated to done.",
             )
             processed.append({"mpn": mpn, "status": "done", "source": source or save_status, "result": save_status})
+            if hard_stop:
+                break
     return processed
+
+
+def requeue_stale_in_progress_rows(stale_seconds=300):
+    ensure_scrub_queue_tables()
+    stale_seconds = max(30, int(stale_seconds or 300))
+    now_ts = time.time()
+    changed = 0
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        rows = conn.execute(
+            "SELECT mpn, updated_at_utc FROM scrub_queue WHERE status='in_progress'"
+        ).fetchall()
+        for mpn, updated in rows:
+            try:
+                age = now_ts - datetime.fromisoformat(str(updated).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                age = stale_seconds + 1
+            if age >= stale_seconds:
+                conn.execute(
+                    "UPDATE scrub_queue SET status='pending', updated_at_utc=? WHERE mpn=?",
+                    (datetime.now(timezone.utc).isoformat(), str(mpn)),
+                )
+                log_scrub_history(
+                    str(mpn),
+                    step="queue_recover",
+                    status="pending",
+                    message=f"Recovered stale in_progress row back to pending (age={int(age)}s).",
+                    conn=conn,
+                )
+                changed += 1
+        conn.commit()
+    return changed
 
 
 def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=400):
@@ -2670,6 +2794,8 @@ def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", dig
         if not one_round:
             break
         all_rows.extend(one_round)
+        if any(str(r.get("status", "")).strip().lower() == "limit_reached" for r in one_round if isinstance(r, dict)):
+            break
     return all_rows
 
 
@@ -2894,6 +3020,10 @@ with ui_tabs[0]:
     bg_file = st.file_uploader("Upload full MPN file (col1=MPN, col2=Manufacturer/Make optional)", type=["xlsx", "csv"], key="bg_queue_upload")
     b1, b2 = st.columns(2)
     run_batch = b2.button("▶ Run queue now (process all)", key="bg_run_batch_btn")
+    recovered_rows = requeue_stale_in_progress_rows(stale_seconds=300)
+    if recovered_rows:
+        st.warning(f"Recovered {recovered_rows} stale in-progress queue rows back to pending.")
+
     if b1.button("📥 Add file to queue", key="bg_enqueue_btn"):
         out = enqueue_scrub_queue_from_upload(bg_file)
         if out.get("error"):
@@ -2910,7 +3040,9 @@ with ui_tabs[0]:
                     max_workers=int(bg_workers),
                 )
                 if processed:
-                    st.success(f"Auto-run started immediately and processed {len(processed)} queued rows.")
+                    if any(str(x.get("status", "")).lower() == "limit_reached" for x in processed if isinstance(x, dict)):
+                        st.warning("Auto-run stopped early because an API limit was reached. Resume after limit reset.")
+                    st.success(f"Auto-run cycle processed {len(processed)} queued rows.")
                     st.dataframe(pd.DataFrame(processed), width="stretch")
                 else:
                     st.info("Auto-run was enabled, but no pending rows were available.")
@@ -2930,7 +3062,9 @@ with ui_tabs[0]:
         else:
             elapsed = max(0.001, time.time() - start_ts)
             rpm = round((len(all_processed) / elapsed) * 60, 2)
-            st.success(f"Processed {len(all_processed)} queue rows | Throughput: {rpm} MPN/min")
+            if any(str(x.get("status", "")).lower() == "limit_reached" for x in all_processed if isinstance(x, dict)):
+                st.warning("Queue processing stopped automatically because an API limit was reached.")
+            st.success(f"Queue run processed {len(all_processed)} rows in this cycle | Throughput: {rpm} MPN/min")
             st.dataframe(pd.DataFrame(all_processed), width="stretch")
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -2952,11 +3086,15 @@ with ui_tabs[0]:
     if not qstats.empty:
         st.dataframe(qstats, width="stretch", hide_index=True)
     if not qstate.empty:
-        st.info(
+        state_msg = (
             f"Last processed MPN: {qstate.iloc[0].get('last_mpn','')} | "
             f"Last status: {qstate.iloc[0].get('last_status','')} | "
             f"Total processed: {int(qstate.iloc[0].get('processed_count',0) or 0)}"
         )
+        if (pending_count + in_progress_count) > 0:
+            st.warning(f"{state_msg} | Queue is NOT complete yet (pending + in-progress = {pending_count + in_progress_count}).")
+        else:
+            st.success(f"{state_msg} | Queue is complete.")
     st.markdown("#### Live Queue Viewer (latest 20)")
     if qlive.empty:
         st.caption("Queue is empty.")
@@ -3070,6 +3208,28 @@ with ui_tabs[2]:
     if "pending_mpns" not in st.session_state:
         st.session_state["pending_mpns"] = []
     view_mpn = st.text_input("Enter MPN", key="scraper_view_mpn")
+    st.caption("Distributor Live Window (Kaynes style): only site details shown.")
+    refresh_live_view = st.button("🔄 Refresh Distributor Live Window", key="refresh_distributor_live_window")
+    if refresh_live_view:
+        if not view_mpn.strip():
+            st.error("Enter MPN first to refresh live distributor window.")
+        else:
+            out_live = fetch_live_into_db_for_mpn(
+                view_mpn.strip(),
+                mouser_key=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK),
+                digikey_id=os.getenv("DIGIKEY_CLIENT_ID", DIGIKEY_CLIENT_ID_FALLBACK),
+                digikey_secret=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK),
+                digikey_scope=os.getenv("DIGIKEY_SCOPE", ""),
+                priority_order=["digikey", "mouser"],
+                save_to_cells=False,
+                fill_empty_from_fallback=True,
+            )
+            if str(out_live.get("status", "")).lower() == "limit_reached":
+                st.warning("Live fetch stopped because API limit was reached.")
+            elif str(out_live.get("status", "")).lower() in {"saved", "unified_only"}:
+                st.success(f"Live payload refresh status: {out_live.get('status')} | Source: {out_live.get('source','')}")
+            else:
+                st.warning(f"Live payload refresh status: {out_live.get('status','unknown')} | {out_live.get('error','')}")
 
     with st.expander("Pending List → Live Fetch to Same DB", expanded=False):
         p1, p2 = st.columns(2)
@@ -3158,6 +3318,31 @@ with ui_tabs[2]:
     last_view_mpn = st.session_state.get("last_view_mpn", "")
 
     if last_view_mpn:
+        with sqlite3.connect(DB_PATH) as conn:
+            live_payload_rows = pd.read_sql(
+                "SELECT data_json, selected_source, fetched_at_utc FROM live_part_cache WHERE mpn=? ORDER BY fetched_at_utc DESC LIMIT 1",
+                conn,
+                params=(last_view_mpn,),
+            )
+        if not live_payload_rows.empty:
+            try:
+                latest_payload = json.loads(str(live_payload_rows.iloc[0]["data_json"] or "{}"))
+            except Exception:
+                latest_payload = {}
+            live_parts_df = pd.DataFrame(latest_payload.get("parts", []) if isinstance(latest_payload, dict) else [])
+            st.markdown("### Distributor Window (Live)")
+            if not live_parts_df.empty:
+                render_live_detail_window(
+                    live_parts_df,
+                    latest_payload.get("pricing", []) if isinstance(latest_payload, dict) else [],
+                    latest_payload.get("attributes", []) if isinstance(latest_payload, dict) else [],
+                    latest_payload.get("documents", []) if isinstance(latest_payload, dict) else [],
+                )
+            else:
+                st.info("No live payload rows found for this MPN. Click 'Refresh Distributor Live Window' to fetch now.")
+        else:
+            st.info("No live payload rows found for this MPN. Click 'Refresh Distributor Live Window' to fetch now.")
+
         st.markdown("### Page 1: All Z2 Tables/Columns")
         if tables_df.empty:
             st.info("No table data found for this MPN in scraper DB.")
