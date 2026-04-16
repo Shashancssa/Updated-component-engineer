@@ -3,6 +3,7 @@ import streamlit.components.v1 as components
 import pandas as pd
 import sqlite3
 import time
+import base64
 import io
 import re
 import os
@@ -1843,7 +1844,30 @@ def render_live_detail_window(parts_df, pricing_rows, attributes_rows, docs_rows
     """
     Render a z2-like detail window from live supplier data.
     """
-    st.markdown("### 🛒 Distributor Live Window")
+    logo_data_uri = ""
+    try:
+        if LOGO_PATH.exists():
+            logo_b64 = base64.b64encode(LOGO_PATH.read_bytes()).decode("utf-8")
+            logo_data_uri = f"data:image/png;base64,{logo_b64}"
+    except Exception:
+        logo_data_uri = ""
+
+    if logo_data_uri:
+        st.markdown(
+            f"""
+            <div style="position:relative;border:1px solid #e5e7eb;border-radius:14px;padding:12px;background:#ffffff;overflow:hidden;">
+                <div style="position:absolute;right:18px;top:16px;opacity:0.08;">
+                    <img src="{logo_data_uri}" style="width:260px;" />
+                </div>
+                <div style="position:relative;z-index:2;">
+                    <h3 style="margin:2px 0 0 0;">🛒 Distributor Live Window</h3>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown("### 🛒 Distributor Live Window")
     if parts_df.empty:
         st.info("No part details available to render.")
         return
@@ -2572,7 +2596,6 @@ def enqueue_scrub_queue_from_upload(file_obj):
 def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4):
     ensure_scrub_queue_tables()
     batch_size = max(1, int(batch_size or 1))
-    now_utc = datetime.now(timezone.utc).isoformat()
     processed = []
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
@@ -2581,21 +2604,14 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
         ).fetchall()
         mpns = [str(r[0]).strip() for r in rows if str(r[0]).strip()]
 
-    max_workers = max(1, min(int(max_workers or 1), 16))
-    if SQLITE_QUEUE_SERIAL_MODE:
-        # SQLite allows only one writer at a time. Force serialized queue workers by default
-        # to prevent "sqlite3.OperationalError: database is locked" during heavy bulk runs.
-        max_workers = 1
-    future_map = {}
-    hard_stop = False
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for i, mpn in enumerate(mpns, start=1):
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
-                conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, mpn))
-                conn.commit()
-            log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Queue item {i}/{len(mpns)} started.")
-            fut = ex.submit(
-                fetch_live_into_db_for_mpn,
+    for i, mpn in enumerate(mpns, start=1):
+        now_utc = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, mpn))
+            conn.commit()
+        log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Queue item {i}/{len(mpns)} started.")
+        try:
+            out = fetch_live_into_db_for_mpn(
                 mpn,
                 mouser_key=mouser_key,
                 digikey_id=digikey_id,
@@ -2605,122 +2621,143 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 save_to_cells=True,
                 fill_empty_from_fallback=fill_empty_from_fallback,
             )
-            future_map[fut] = mpn
+            if not isinstance(out, dict):
+                out = {"mpn": mpn, "status": "error", "error": "Invalid worker result type"}
+        except Exception as exn:
+            out = {"mpn": mpn, "status": "error", "error": str(exn)}
 
-        for fut in as_completed(future_map):
-            mpn = future_map[fut]
-            try:
-                out = fut.result()
-                if not isinstance(out, dict):
-                    out = {"mpn": mpn, "status": "error", "error": "Invalid worker result type"}
-                out.setdefault("mpn", mpn)
-            except Exception as exn:
-                out = {"mpn": mpn, "status": "error", "error": str(exn)}
-
-            mpn = str(out.get("mpn", "")).strip()
-            if not mpn:
-                continue
-            if str(out.get("status", "")).strip().lower() == "error":
-                err = str(out.get("error", "Unknown queue error"))
-                with sqlite3.connect(DB_PATH, timeout=30) as conn:
-                    conn.execute(
-                        "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
-                        (err, datetime.now(timezone.utc).isoformat(), mpn),
-                    )
-                    conn.execute(
-                        "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
-                        (mpn, datetime.now(timezone.utc).isoformat()),
-                    )
-                    conn.commit()
-                log_scrub_history(mpn, step="process_error", status="error", message=err)
-                processed.append({"mpn": mpn, "status": "error", "error": err})
-                continue
-
-            source = str(out.get("source", "")).strip()
-            save_status = str(out.get("status", "")).strip()
-            err_msg = str(out.get("error", "")).strip()
-            if save_status == "limit_reached" or _is_api_limit_error_message(err_msg) or _is_api_limit_error_message(source):
-                stop_reason = err_msg or source or "API limit reached"
-                with sqlite3.connect(DB_PATH, timeout=30) as conn:
-                    conn.execute(
-                        "UPDATE scrub_queue SET status='error', source=?, last_error=?, updated_at_utc=? WHERE mpn=?",
-                        (source or "API_LIMIT", stop_reason, datetime.now(timezone.utc).isoformat(), mpn),
-                    )
-                    conn.execute(
-                        "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
-                        (mpn, datetime.now(timezone.utc).isoformat()),
-                    )
-                    conn.commit()
-                log_scrub_history(
-                    mpn,
-                    step="process_error",
-                    status="error",
-                    source=source or "API_LIMIT",
-                    message=f"Queue stopped due to API limit: {stop_reason}",
-                )
-                processed.append({"mpn": mpn, "status": "limit_reached", "source": source or "API_LIMIT", "error": stop_reason, "stop_all": True})
-                hard_stop = True
-                continue
-
-            if save_status not in ("saved", "unified_only"):
-                err = f"No DB save completed (status={save_status or 'unknown'})."
-                with sqlite3.connect(DB_PATH, timeout=30) as conn:
-                    conn.execute(
-                        "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
-                        (err, datetime.now(timezone.utc).isoformat(), mpn),
-                    )
-                    conn.execute(
-                        "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
-                        (mpn, datetime.now(timezone.utc).isoformat()),
-                    )
-                    conn.commit()
-                log_scrub_history(mpn, step="process_error", status="error", message=err)
-                processed.append({"mpn": mpn, "status": "error", "error": err})
-                continue
-
-            if save_status == "unified_only":
-                warn_msg = err_msg or source or "No live payload found from providers."
-                log_scrub_history(
-                    mpn,
-                    step="fetch_warning",
-                    status="warning",
-                    source=source,
-                    message=f"No live payload found; only unified cache was refreshed. Reason: {warn_msg}",
-                )
-                with sqlite3.connect(DB_PATH, timeout=30) as conn:
-                    conn.execute(
-                        "UPDATE scrub_queue SET status='error', source=?, last_error=?, updated_at_utc=? WHERE mpn=?",
-                        (source or save_status, warn_msg, datetime.now(timezone.utc).isoformat(), mpn),
-                    )
-                    conn.execute(
-                        "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
-                        (mpn, datetime.now(timezone.utc).isoformat()),
-                    )
-                    conn.commit()
-                processed.append({"mpn": mpn, "status": "error", "source": source or save_status, "error": warn_msg})
-                continue
-
+        mpn = str(out.get("mpn", "")).strip()
+        if not mpn:
+            continue
+        if str(out.get("status", "")).strip().lower() == "error":
+            err = str(out.get("error", "Unknown queue error"))
             with sqlite3.connect(DB_PATH, timeout=30) as conn:
                 conn.execute(
-                    "UPDATE scrub_queue SET status='done', source=?, last_error='', updated_at_utc=? WHERE mpn=?",
-                    (source or save_status, datetime.now(timezone.utc).isoformat(), mpn),
+                    "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
+                    (err, datetime.now(timezone.utc).isoformat(), mpn),
                 )
                 conn.execute(
-                    "UPDATE scrub_queue_state SET last_mpn=?, last_status='done', processed_count=processed_count+1, updated_at_utc=? WHERE id=1",
+                    "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
+                    (mpn, datetime.now(timezone.utc).isoformat()),
+                )
+                conn.commit()
+            log_scrub_history(mpn, step="process_error", status="error", message=err)
+            processed.append({"mpn": mpn, "status": "error", "error": err})
+            continue
+
+        source = str(out.get("source", "")).strip()
+        save_status = str(out.get("status", "")).strip()
+        err_msg = str(out.get("error", "")).strip()
+        if save_status == "limit_reached" or _is_api_limit_error_message(err_msg) or _is_api_limit_error_message(source):
+            stop_reason = err_msg or source or "API limit reached"
+            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                conn.execute(
+                    "UPDATE scrub_queue SET status='error', source=?, last_error=?, updated_at_utc=? WHERE mpn=?",
+                    (source or "API_LIMIT", stop_reason, datetime.now(timezone.utc).isoformat(), mpn),
+                )
+                conn.execute(
+                    "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
                     (mpn, datetime.now(timezone.utc).isoformat()),
                 )
                 conn.commit()
             log_scrub_history(
                 mpn,
-                step="process_done",
-                status="done",
-                source=source or save_status,
-                message="Queue item completed and status updated to done.",
+                step="process_error",
+                status="error",
+                source=source or "API_LIMIT",
+                message=f"Queue stopped due to API limit: {stop_reason}",
             )
-            processed.append({"mpn": mpn, "status": "done", "source": source or save_status, "result": save_status})
-            if hard_stop:
-                break
+            processed.append({"mpn": mpn, "status": "limit_reached", "source": source or "API_LIMIT", "error": stop_reason, "stop_all": True})
+            break
+
+        if save_status not in ("saved", "unified_only"):
+            err = f"No DB save completed (status={save_status or 'unknown'})."
+            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                conn.execute(
+                    "UPDATE scrub_queue SET status='error', last_error=?, updated_at_utc=? WHERE mpn=?",
+                    (err, datetime.now(timezone.utc).isoformat(), mpn),
+                )
+                conn.execute(
+                    "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
+                    (mpn, datetime.now(timezone.utc).isoformat()),
+                )
+                conn.commit()
+            log_scrub_history(mpn, step="process_error", status="error", message=err)
+            processed.append({"mpn": mpn, "status": "error", "error": err})
+            continue
+
+        if save_status == "unified_only":
+            warn_msg = err_msg or source or "No live payload found from providers."
+            log_scrub_history(
+                mpn,
+                step="fetch_warning",
+                status="warning",
+                source=source,
+                message=f"No live payload found; only unified cache was refreshed. Reason: {warn_msg}",
+            )
+            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                conn.execute(
+                    "UPDATE scrub_queue SET status='error', source=?, last_error=?, updated_at_utc=? WHERE mpn=?",
+                    (source or save_status, warn_msg, datetime.now(timezone.utc).isoformat(), mpn),
+                )
+                conn.execute(
+                    "UPDATE scrub_queue_state SET last_mpn=?, last_status='error', updated_at_utc=? WHERE id=1",
+                    (mpn, datetime.now(timezone.utc).isoformat()),
+                )
+                conn.commit()
+            processed.append({"mpn": mpn, "status": "error", "source": source or save_status, "error": warn_msg})
+            continue
+
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            conn.execute(
+                "UPDATE scrub_queue SET status='done', source=?, last_error='', updated_at_utc=? WHERE mpn=?",
+                (source or save_status, datetime.now(timezone.utc).isoformat(), mpn),
+            )
+            conn.execute(
+                "UPDATE scrub_queue_state SET last_mpn=?, last_status='done', processed_count=processed_count+1, updated_at_utc=? WHERE id=1",
+                (mpn, datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+        log_scrub_history(
+            mpn,
+            step="process_done",
+            status="done",
+            source=source or save_status,
+            message="Queue item completed and status updated to done.",
+        )
+        processed.append({"mpn": mpn, "status": "done", "source": source or save_status, "result": save_status})
     return processed
+
+
+def requeue_stale_in_progress_rows(stale_seconds=300):
+    ensure_scrub_queue_tables()
+    stale_seconds = max(30, int(stale_seconds or 300))
+    now_ts = time.time()
+    changed = 0
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        rows = conn.execute(
+            "SELECT mpn, updated_at_utc FROM scrub_queue WHERE status='in_progress'"
+        ).fetchall()
+        for mpn, updated in rows:
+            try:
+                age = now_ts - datetime.fromisoformat(str(updated).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                age = stale_seconds + 1
+            if age >= stale_seconds:
+                conn.execute(
+                    "UPDATE scrub_queue SET status='pending', updated_at_utc=? WHERE mpn=?",
+                    (datetime.now(timezone.utc).isoformat(), str(mpn)),
+                )
+                log_scrub_history(
+                    str(mpn),
+                    step="queue_recover",
+                    status="pending",
+                    message=f"Recovered stale in_progress row back to pending (age={int(age)}s).",
+                    conn=conn,
+                )
+                changed += 1
+        conn.commit()
+    return changed
 
 
 def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=400):
@@ -2963,8 +3000,19 @@ with ui_tabs[0]:
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
 
     bg_file = st.file_uploader("Upload full MPN file (col1=MPN, col2=Manufacturer/Make optional)", type=["xlsx", "csv"], key="bg_queue_upload")
-    b1, b2 = st.columns(2)
+    b1, b2, b3 = st.columns(3)
     run_batch = b2.button("▶ Run queue now (process all)", key="bg_run_batch_btn")
+    force_requeue = b3.button("♻ Reset in-progress to pending", key="bg_force_requeue_btn")
+    if force_requeue:
+        moved = requeue_stale_in_progress_rows(stale_seconds=1)
+        if moved:
+            st.success(f"Reset {moved} in-progress rows back to pending.")
+        else:
+            st.info("No in-progress rows needed reset.")
+    recovered_rows = requeue_stale_in_progress_rows(stale_seconds=300)
+    if recovered_rows:
+        st.warning(f"Recovered {recovered_rows} stale in-progress queue rows back to pending.")
+
     if b1.button("📥 Add file to queue", key="bg_enqueue_btn"):
         out = enqueue_scrub_queue_from_upload(bg_file)
         if out.get("error"):
@@ -2983,7 +3031,7 @@ with ui_tabs[0]:
                 if processed:
                     if any(str(x.get("status", "")).lower() == "limit_reached" for x in processed if isinstance(x, dict)):
                         st.warning("Auto-run stopped early because an API limit was reached. Resume after limit reset.")
-                    st.success(f"Auto-run started immediately and processed {len(processed)} queued rows.")
+                    st.success(f"Auto-run cycle processed {len(processed)} queued rows.")
                     st.dataframe(pd.DataFrame(processed), width="stretch")
                 else:
                     st.info("Auto-run was enabled, but no pending rows were available.")
@@ -3005,7 +3053,7 @@ with ui_tabs[0]:
             rpm = round((len(all_processed) / elapsed) * 60, 2)
             if any(str(x.get("status", "")).lower() == "limit_reached" for x in all_processed if isinstance(x, dict)):
                 st.warning("Queue processing stopped automatically because an API limit was reached.")
-            st.success(f"Processed {len(all_processed)} queue rows | Throughput: {rpm} MPN/min")
+            st.success(f"Queue run processed {len(all_processed)} rows in this cycle | Throughput: {rpm} MPN/min")
             st.dataframe(pd.DataFrame(all_processed), width="stretch")
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -3027,11 +3075,15 @@ with ui_tabs[0]:
     if not qstats.empty:
         st.dataframe(qstats, width="stretch", hide_index=True)
     if not qstate.empty:
-        st.info(
+        state_msg = (
             f"Last processed MPN: {qstate.iloc[0].get('last_mpn','')} | "
             f"Last status: {qstate.iloc[0].get('last_status','')} | "
             f"Total processed: {int(qstate.iloc[0].get('processed_count',0) or 0)}"
         )
+        if (pending_count + in_progress_count) > 0:
+            st.warning(f"{state_msg} | Queue is NOT complete yet (pending + in-progress = {pending_count + in_progress_count}).")
+        else:
+            st.success(f"{state_msg} | Queue is complete.")
     st.markdown("#### Live Queue Viewer (latest 20)")
     if qlive.empty:
         st.caption("Queue is empty.")
@@ -3145,30 +3197,7 @@ with ui_tabs[2]:
     if "pending_mpns" not in st.session_state:
         st.session_state["pending_mpns"] = []
     view_mpn = st.text_input("Enter MPN", key="scraper_view_mpn")
-    st.caption("Live Distributor Window: fetch latest supplier data and render a distributor-style viewer.")
-    lv1, lv2 = st.columns(2)
-    live_view_mouser = lv1.text_input(
-        "Live Viewer Mouser API Key (Optional)",
-        value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK),
-        type="password",
-        key="live_view_mouser_key",
-    )
-    live_view_dk_id = lv2.text_input(
-        "Live Viewer Digi-Key Client ID (Optional)",
-        value=os.getenv("DIGIKEY_CLIENT_ID", DIGIKEY_CLIENT_ID_FALLBACK),
-        key="live_view_dk_id",
-    )
-    live_view_dk_secret = lv2.text_input(
-        "Live Viewer Digi-Key Client Secret (Optional)",
-        value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK),
-        type="password",
-        key="live_view_dk_secret",
-    )
-    live_view_dk_scope = lv2.text_input(
-        "Live Viewer Digi-Key Scope (Optional)",
-        value=os.getenv("DIGIKEY_SCOPE", ""),
-        key="live_view_dk_scope",
-    )
+    st.caption("Distributor Live Window (Kaynes style): only site details shown.")
     refresh_live_view = st.button("🔄 Refresh Distributor Live Window", key="refresh_distributor_live_window")
     if refresh_live_view:
         if not view_mpn.strip():
@@ -3176,10 +3205,10 @@ with ui_tabs[2]:
         else:
             out_live = fetch_live_into_db_for_mpn(
                 view_mpn.strip(),
-                mouser_key=live_view_mouser,
-                digikey_id=live_view_dk_id,
-                digikey_secret=live_view_dk_secret,
-                digikey_scope=live_view_dk_scope,
+                mouser_key=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK),
+                digikey_id=os.getenv("DIGIKEY_CLIENT_ID", DIGIKEY_CLIENT_ID_FALLBACK),
+                digikey_secret=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK),
+                digikey_scope=os.getenv("DIGIKEY_SCOPE", ""),
                 priority_order=["digikey", "mouser"],
                 save_to_cells=False,
                 fill_empty_from_fallback=True,
