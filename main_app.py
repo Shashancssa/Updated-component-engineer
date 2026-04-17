@@ -814,9 +814,30 @@ def fetch_digikey_part_data(
     parameters = product.get("Parameters") if isinstance(product.get("Parameters"), list) else []
     lifecycle_status = _digikey_lifecycle(product, parameters)
 
-    manufacturer_pn = _dk_text(product.get("ManufacturerPartNumber", ""))
+    manufacturer_pn = _dk_text(
+        product.get("ManufacturerProductNumber", "")
+        or product.get("ManufacturerPartNumber", "")
+    )
     digikey_pn = _dk_text(product.get("DigiKeyPartNumber", ""))
     preferred_ref = manufacturer_pn or digikey_pn
+    description_obj = product.get("Description", {}) if isinstance(product.get("Description", {}), dict) else {}
+    dk_description = _dk_text(
+        description_obj.get("ProductDescription", "")
+        or description_obj.get("DetailedDescription", "")
+        or product.get("ProductDescription", "")
+        or product.get("Description", "")
+    )
+    classifications = product.get("Classifications", {}) if isinstance(product.get("Classifications", {}), dict) else {}
+    rohs_status = _dk_text(
+        product.get("RohsStatus", "")
+        or product.get("RoHSStatus", "")
+        or classifications.get("RohsStatus", "")
+        or classifications.get("RoHSStatus", "")
+    )
+    if not rohs_status:
+        rohs_compliant = product.get("RoHSCompliant", product.get("RohsCompliant", ""))
+        if isinstance(rohs_compliant, bool):
+            rohs_status = "RoHS Compliant" if rohs_compliant else "RoHS Non-Compliant"
 
     part_row = {
         "Requested MPN": str(part_number).strip(),
@@ -824,14 +845,14 @@ def fetch_digikey_part_data(
         "Manufacturer Part Number": manufacturer_pn,
         "Digi-Key Part Number": digikey_pn,
         "Manufacturer": _dk_text((product.get("Manufacturer", {}) or {}).get("Name", "") if isinstance(product.get("Manufacturer", {}), dict) else product.get("Manufacturer", "")),
-        "Description": _dk_text(product.get("ProductDescription", "") or product.get("Description", "")),
+        "Description": dk_description,
         "Category": _dk_text((product.get("Category", {}) or {}).get("Name", "") if isinstance(product.get("Category", {}), dict) else product.get("Category", "")),
         "Lifecycle Status": lifecycle_status,
         "Quantity Available": _dk_text(product.get("QuantityAvailable", "")),
         "Lead Time Weeks": _dk_text(product.get("ManufacturerLeadWeeks", "")),
         "Product URL": _dk_text(product.get("ProductUrl", "")),
         "Data Sheet URL": _dk_text(product.get("DatasheetUrl", "")),
-        "RoHS": _dk_text(product.get("RoHSStatus", "")),
+        "RoHS": rohs_status,
     }
 
     pricing_rows = []
@@ -860,6 +881,21 @@ def fetch_digikey_part_data(
                 "Value": a.get("ValueText", "") or a.get("Value", ""),
             }
         )
+    for attr_name, attr_val in [
+        ("RoHS Status", rohs_status),
+        ("REACH Status", _dk_text(classifications.get("ReachStatus", "") or product.get("ReachStatus", ""))),
+        ("ECCN", _dk_text(classifications.get("ExportControlClassNumber", "") or product.get("ExportControlClassNumber", ""))),
+        ("HTSUS Code", _dk_text(classifications.get("HtsusCode", "") or product.get("HtsusCode", ""))),
+    ]:
+        if str(attr_val).strip():
+            attribute_rows.append(
+                {
+                    "Requested MPN": str(part_number).strip(),
+                    "Supplier Part Number": part_row["Supplier Part Number"],
+                    "Attribute": attr_name,
+                    "Value": attr_val,
+                }
+            )
 
     docs_rows = []
     if part_row["Data Sheet URL"]:
