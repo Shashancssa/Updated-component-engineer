@@ -2866,7 +2866,7 @@ def requeue_stale_in_progress_rows(stale_seconds=300):
     return changed
 
 
-def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=0):
+def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=400):
     """Drain the full pending/error queue without exposing batch controls in UI."""
     all_rows = []
     if not internal_chunk_size or int(internal_chunk_size) <= 0:
