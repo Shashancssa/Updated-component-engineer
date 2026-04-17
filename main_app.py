@@ -2424,6 +2424,13 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
             "digikey": SOURCE_DIGIKEY,
             "mouser": SOURCE_MOUSER,
         }
+        def _payload_has_lifecycle(payload_obj):
+            if not isinstance(payload_obj, dict):
+                return False
+            part0 = (payload_obj.get("parts") or [{}])[0] if isinstance(payload_obj.get("parts"), list) else {}
+            if not isinstance(part0, dict):
+                return False
+            return bool(str(part0.get("Lifecycle Status", "")).strip() or str(part0.get("Part Lifecycle", "")).strip())
 
         def _build_provider_task(provider_key):
             p = str(provider_key).strip().lower()
@@ -2482,7 +2489,11 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                     payload, err = _call_with_retry(task, max_attempts=1, retry_delay=0.15)
                     if payload and isinstance(payload, dict) and payload.get("parts"):
                         payload_by_provider[provider_key] = payload
-                        break
+                        # Keep speed-first behavior, but if lifecycle is missing, try next provider(s)
+                        # to backfill this critical field.
+                        if _payload_has_lifecycle(payload):
+                            break
+                        continue
                     if err:
                         provider_errors.append(f"{provider_name}: {str(err)[:220]}")
                     else:
@@ -2520,8 +2531,6 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
             part0 = (payload.get("parts") or [{}])[0] if isinstance(payload, dict) else {}
             if isinstance(part0, dict) and _coverage_score(part0) > _coverage_score(best_part):
                 best_part = part0
-            if payloads and not fill_empty_from_fallback:
-                break
 
         if not payloads:
             return None, "; ".join(provider_errors[:3])
@@ -2674,8 +2683,8 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
             message=f"Queue item started (position {zero_idx + 1}).",
         )
         try:
-            out = fetch_live_into_db_for_mpn(
-                mpn,
+            raw_out = fetch_live_into_db_for_mpn(
+                one_mpn,
                 mouser_key=mouser_key,
                 digikey_id=digikey_id,
                 digikey_secret=digikey_secret,
@@ -2684,10 +2693,21 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 save_to_cells=True,
                 fill_empty_from_fallback=fill_empty_from_fallback,
             )
-            if not isinstance(out, dict):
-                out = {"mpn": mpn, "status": "error", "error": "Invalid worker result type"}
+            if isinstance(raw_out, dict):
+                out = raw_out
+            elif isinstance(raw_out, tuple) and len(raw_out) >= 2:
+                payload, source = raw_out[0], raw_out[1]
+                out = {
+                    "mpn": one_mpn,
+                    "source": str(source or ""),
+                    "status": "saved" if payload is not None else "unified_only",
+                    "error": "" if payload is not None else str(source or ""),
+                }
+            else:
+                out = {"mpn": one_mpn, "status": "saved", "source": "", "error": "", "result": str(raw_out)}
         except Exception as exn:
-            out = {"mpn": mpn, "status": "error", "error": str(exn)}
+            out = {"mpn": one_mpn, "status": "error", "error": str(exn)}
+        return out
 
     def _finalize_queue_result(out):
         stop_all = False
@@ -3119,10 +3139,6 @@ with ui_tabs[0]:
     if recovered_rows:
         st.warning(f"Recovered {recovered_rows} stale in-progress queue rows back to pending.")
     st.caption(f"Stale in-progress auto-recovery window: {QUEUE_STALE_RECOVERY_SECONDS} seconds.")
-
-    effective_bg_workers = 16 if bg_high_speed else int(bg_workers)
-    if bg_high_speed:
-        st.caption("High speed mode enabled: using single-provider first-hit strategy with 16 workers for maximum throughput.")
 
     effective_bg_workers = 16 if bg_high_speed else int(bg_workers)
     if bg_high_speed:
