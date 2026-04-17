@@ -74,9 +74,9 @@ def _is_api_limit_error_message(msg):
 
 
 DEFAULT_MOUSER_DAILY_LIMIT = int(os.getenv("MOUSER_DAILY_LIMIT", "20000") or 20000)
-DEFAULT_DIGIKEY_DAILY_LIMIT = int(os.getenv("DIGIKEY_DAILY_LIMIT", "1000") or 1000)
+DEFAULT_DIGIKEY_DAILY_LIMIT = int(os.getenv("DIGIKEY_DAILY_LIMIT", "50000") or 50000)
 DEFAULT_MOUSER_MIN_INTERVAL_SEC = float(os.getenv("MOUSER_MIN_INTERVAL_SEC", "0.6") or 0.6)
-DEFAULT_DIGIKEY_MIN_INTERVAL_SEC = float(os.getenv("DIGIKEY_MIN_INTERVAL_SEC", "0.6") or 0.6)
+DEFAULT_DIGIKEY_MIN_INTERVAL_SEC = float(os.getenv("DIGIKEY_MIN_INTERVAL_SEC", "0.2") or 0.2)
 SQLITE_QUEUE_SERIAL_MODE = str(os.getenv("SQLITE_QUEUE_SERIAL_MODE", "1")).strip().lower() not in {"0", "false", "no"}
 
 st.set_page_config(layout="wide", page_title="COMPONENT ENGINEER DATABASE", page_icon="🛡️")
@@ -2947,7 +2947,8 @@ with ui_tabs[0]:
     live_dk_scope = lc1.text_input("Digi-Key Scope (Optional)", value=os.getenv("DIGIKEY_SCOPE", ""), key="live_combo_dk_scope")
     live_mouser = lc2.text_input("Mouser API Key (Optional)", value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK), type="password", key="live_combo_mouser")
     live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Mouser)", value=False, key="live_combo_split_mode")
-    live_workers = st.number_input("Live combo parallel workers", min_value=1, max_value=16, value=4, step=1, key="live_combo_workers")
+    live_high_speed = st.toggle("🚀 High Speed Mode (Digi-Key first hit, reduced fallback merge)", value=False, key="live_combo_high_speed")
+    live_workers = st.number_input("Live combo parallel workers", min_value=1, max_value=16, value=8, step=1, key="live_combo_workers")
     st.caption("Tip: Use 4-8 workers to target ~30+ MPN/min, based on API/network response time.")
     live_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="live_combo_fill_empty")
     if st.button("Start Live Combo Scraper", key="live_combo_run"):
@@ -2959,10 +2960,17 @@ with ui_tabs[0]:
         if not live_mpns:
             st.error("Please upload or enter at least one MPN.")
         else:
+            effective_workers = int(live_workers)
+            effective_split_mode = bool(live_split_mode)
+            effective_fill_empty = bool(live_fill_empty)
+            if live_high_speed:
+                effective_workers = max(effective_workers, 12)
+                effective_split_mode = True
+                effective_fill_empty = False
             start_ts = time.time()
             bar = st.progress(15)
             status_txt = st.empty()
-            status_txt.info(f"Running {len(live_mpns)} MPNs with {int(live_workers)} parallel workers...")
+            status_txt.info(f"Running {len(live_mpns)} MPNs with {effective_workers} parallel workers...")
             def _live_worker(one_mpn, zero_idx):
                 return fetch_live_into_db_for_mpn(
                     one_mpn,
@@ -2970,11 +2978,11 @@ with ui_tabs[0]:
                     digikey_id=live_dk_id,
                     digikey_secret=live_dk_secret,
                     digikey_scope=live_dk_scope,
-                    priority_order=_rotating_priority_for_index(zero_idx, split_mode=live_split_mode),
+                    priority_order=_rotating_priority_for_index(zero_idx, split_mode=effective_split_mode),
                     save_to_cells=True,
-                    fill_empty_from_fallback=live_fill_empty,
+                    fill_empty_from_fallback=effective_fill_empty,
                 )
-            rows = process_mpns_concurrently(live_mpns, _live_worker, max_workers=int(live_workers))
+            rows = process_mpns_concurrently(live_mpns, _live_worker, max_workers=effective_workers)
             bar.progress(100)
             elapsed = max(0.001, time.time() - start_ts)
             rpm = round((len(rows) / elapsed) * 60, 2)
@@ -2994,7 +3002,8 @@ with ui_tabs[0]:
     bg_dk_secret = bgc1.text_input("Queue Digi-Key Client Secret", value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK), type="password", key="bg_dk_secret")
     bg_dk_scope = bgc1.text_input("Queue Digi-Key Scope", value=os.getenv("DIGIKEY_SCOPE", ""), key="bg_dk_scope")
     bg_fill_empty = bgc2.toggle("Queue fallback fill empty fields", value=True, key="bg_fill_empty")
-    bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=16, value=4, step=1, key="bg_workers")
+    bg_high_speed = bgc2.toggle("🚀 Queue High Speed Mode (Digi-Key first hit)", value=False, key="bg_high_speed")
+    bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=16, value=8, step=1, key="bg_workers")
     if SQLITE_QUEUE_SERIAL_MODE:
         st.caption("SQLite safe mode is ON: queue writes are serialized (effective workers = 1) to avoid database lock errors.")
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
@@ -3025,8 +3034,9 @@ with ui_tabs[0]:
                     digikey_id=bg_dk_id,
                     digikey_secret=bg_dk_secret,
                     digikey_scope=bg_dk_scope,
-                    fill_empty_from_fallback=bg_fill_empty,
+                    fill_empty_from_fallback=(False if bg_high_speed else bg_fill_empty),
                     max_workers=int(bg_workers),
+                    internal_chunk_size=(1200 if bg_high_speed else 400),
                 )
                 if processed:
                     if any(str(x.get("status", "")).lower() == "limit_reached" for x in processed if isinstance(x, dict)):
@@ -3043,8 +3053,9 @@ with ui_tabs[0]:
             digikey_id=bg_dk_id,
             digikey_secret=bg_dk_secret,
             digikey_scope=bg_dk_scope,
-            fill_empty_from_fallback=bg_fill_empty,
+            fill_empty_from_fallback=(False if bg_high_speed else bg_fill_empty),
             max_workers=int(bg_workers),
+            internal_chunk_size=(1200 if bg_high_speed else 400),
         )
         if not all_processed:
             st.info("No pending queue rows. Queue is idle.")
