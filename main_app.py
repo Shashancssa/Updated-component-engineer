@@ -77,7 +77,8 @@ DEFAULT_MOUSER_DAILY_LIMIT = int(os.getenv("MOUSER_DAILY_LIMIT", "20000") or 200
 DEFAULT_DIGIKEY_DAILY_LIMIT = int(os.getenv("DIGIKEY_DAILY_LIMIT", "50000") or 50000)
 DEFAULT_MOUSER_MIN_INTERVAL_SEC = float(os.getenv("MOUSER_MIN_INTERVAL_SEC", "0.6") or 0.6)
 DEFAULT_DIGIKEY_MIN_INTERVAL_SEC = float(os.getenv("DIGIKEY_MIN_INTERVAL_SEC", "0.2") or 0.2)
-SQLITE_QUEUE_SERIAL_MODE = str(os.getenv("SQLITE_QUEUE_SERIAL_MODE", "1")).strip().lower() not in {"0", "false", "no"}
+SQLITE_QUEUE_SERIAL_MODE = str(os.getenv("SQLITE_QUEUE_SERIAL_MODE", "0")).strip().lower() not in {"0", "false", "no"}
+QUEUE_STALE_RECOVERY_SECONDS = int(os.getenv("QUEUE_STALE_RECOVERY_SECONDS", "1800") or 1800)
 
 st.set_page_config(layout="wide", page_title="COMPONENT ENGINEER DATABASE", page_icon="🛡️")
 
@@ -2657,12 +2658,21 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
         ).fetchall()
         mpns = [str(r[0]).strip() for r in rows if str(r[0]).strip()]
 
-    for i, mpn in enumerate(mpns, start=1):
+    max_workers = max(1, min(int(max_workers or 1), 16))
+    if SQLITE_QUEUE_SERIAL_MODE:
+        max_workers = 1
+
+    def _queue_worker(one_mpn, zero_idx):
         now_utc = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
-            conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, mpn))
+            conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, one_mpn))
             conn.commit()
-        log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Queue item {i}/{len(mpns)} started.")
+        log_scrub_history(
+            one_mpn,
+            step="process_start",
+            status="in_progress",
+            message=f"Queue item started (position {zero_idx + 1}).",
+        )
         try:
             out = fetch_live_into_db_for_mpn(
                 mpn,
@@ -2679,9 +2689,11 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
         except Exception as exn:
             out = {"mpn": mpn, "status": "error", "error": str(exn)}
 
+    def _finalize_queue_result(out):
+        stop_all = False
         mpn = str(out.get("mpn", "")).strip()
         if not mpn:
-            continue
+            return stop_all
         if str(out.get("status", "")).strip().lower() == "error":
             err = str(out.get("error", "Unknown queue error"))
             with sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -2696,7 +2708,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 conn.commit()
             log_scrub_history(mpn, step="process_error", status="error", message=err)
             processed.append({"mpn": mpn, "status": "error", "error": err})
-            continue
+            return stop_all
 
         source = str(out.get("source", "")).strip()
         save_status = str(out.get("status", "")).strip()
@@ -2721,7 +2733,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 message=f"Queue stopped due to API limit: {stop_reason}",
             )
             processed.append({"mpn": mpn, "status": "limit_reached", "source": source or "API_LIMIT", "error": stop_reason, "stop_all": True})
-            break
+            return True
 
         if save_status not in ("saved", "unified_only"):
             err = f"No DB save completed (status={save_status or 'unknown'})."
@@ -2737,7 +2749,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 conn.commit()
             log_scrub_history(mpn, step="process_error", status="error", message=err)
             processed.append({"mpn": mpn, "status": "error", "error": err})
-            continue
+            return stop_all
 
         if save_status == "unified_only":
             warn_msg = err_msg or source or "No live payload found from providers."
@@ -2759,7 +2771,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 )
                 conn.commit()
             processed.append({"mpn": mpn, "status": "error", "source": source or save_status, "error": warn_msg})
-            continue
+            return stop_all
 
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
             conn.execute(
@@ -2779,6 +2791,26 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
             message="Queue item completed and status updated to done.",
         )
         processed.append({"mpn": mpn, "status": "done", "source": source or save_status, "result": save_status})
+        return stop_all
+
+    if max_workers > 1 and len(mpns) > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {ex.submit(_queue_worker, mpn, idx): (idx, mpn) for idx, mpn in enumerate(mpns)}
+            for fut in as_completed(future_map):
+                idx, mpn = future_map[fut]
+                try:
+                    out = fut.result()
+                    if not isinstance(out, dict):
+                        out = {"mpn": mpn, "status": "error", "error": "Invalid worker result type"}
+                except Exception as exn:
+                    out = {"mpn": mpn, "status": "error", "error": str(exn)}
+                if _finalize_queue_result(out):
+                    break
+    else:
+        for idx, mpn in enumerate(mpns):
+            out = _queue_worker(mpn, idx)
+            if _finalize_queue_result(out):
+                break
     return processed
 
 
@@ -3083,9 +3115,14 @@ with ui_tabs[0]:
             st.success(f"Reset {moved} in-progress rows back to pending.")
         else:
             st.info("No in-progress rows needed reset.")
-    recovered_rows = requeue_stale_in_progress_rows(stale_seconds=300)
+    recovered_rows = requeue_stale_in_progress_rows(stale_seconds=QUEUE_STALE_RECOVERY_SECONDS)
     if recovered_rows:
         st.warning(f"Recovered {recovered_rows} stale in-progress queue rows back to pending.")
+    st.caption(f"Stale in-progress auto-recovery window: {QUEUE_STALE_RECOVERY_SECONDS} seconds.")
+
+    effective_bg_workers = 16 if bg_high_speed else int(bg_workers)
+    if bg_high_speed:
+        st.caption("High speed mode enabled: using single-provider first-hit strategy with 16 workers for maximum throughput.")
 
     effective_bg_workers = 16 if bg_high_speed else int(bg_workers)
     if bg_high_speed:
