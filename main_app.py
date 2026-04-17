@@ -2470,24 +2470,41 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                 provider_tasks[str(provider).strip().lower()] = task
 
         if provider_tasks:
-            with ThreadPoolExecutor(max_workers=max(1, len(provider_tasks))) as executor:
-                future_map = {
-                    executor.submit(_call_with_retry, task): provider_key
-                    for provider_key, task in provider_tasks.items()
-                }
-                for future in as_completed(future_map):
-                    provider_key = future_map[future]
+            if not fill_empty_from_fallback:
+                # High-throughput mode: avoid parallel multi-provider calls for same MPN.
+                for provider in provider_order:
+                    provider_key = str(provider).strip().lower()
+                    task = provider_tasks.get(provider_key)
+                    if not task:
+                        continue
                     provider_name = provider_name_map.get(provider_key, provider_key)
-                    try:
-                        payload, err = future.result()
-                    except Exception as ex:
-                        payload, err = None, str(ex)
+                    payload, err = _call_with_retry(task, max_attempts=1, retry_delay=0.15)
                     if payload and isinstance(payload, dict) and payload.get("parts"):
                         payload_by_provider[provider_key] = payload
-                    elif err:
+                        break
+                    if err:
                         provider_errors.append(f"{provider_name}: {str(err)[:220]}")
                     else:
                         provider_errors.append(f"{provider_name}: no match")
+            else:
+                with ThreadPoolExecutor(max_workers=max(1, len(provider_tasks))) as executor:
+                    future_map = {
+                        executor.submit(_call_with_retry, task): provider_key
+                        for provider_key, task in provider_tasks.items()
+                    }
+                    for future in as_completed(future_map):
+                        provider_key = future_map[future]
+                        provider_name = provider_name_map.get(provider_key, provider_key)
+                        try:
+                            payload, err = future.result()
+                        except Exception as ex:
+                            payload, err = None, str(ex)
+                        if payload and isinstance(payload, dict) and payload.get("parts"):
+                            payload_by_provider[provider_key] = payload
+                        elif err:
+                            provider_errors.append(f"{provider_name}: {str(err)[:220]}")
+                        else:
+                            provider_errors.append(f"{provider_name}: no match")
 
         payloads = []
         sources = []
@@ -3041,7 +3058,7 @@ with ui_tabs[0]:
     bg_dk_scope = bgc1.text_input("Queue Digi-Key Scope", value=os.getenv("DIGIKEY_SCOPE", ""), key="bg_dk_scope")
     bg_fill_empty = bgc2.toggle("Queue fallback fill empty fields", value=True, key="bg_fill_empty")
     bg_high_speed = bgc2.toggle("🚀 Queue High Speed Mode (Digi-Key first hit)", value=False, key="bg_high_speed")
-    bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=16, value=8, step=1, key="bg_workers")
+    bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=16, value=16, step=1, key="bg_workers")
     if SQLITE_QUEUE_SERIAL_MODE:
         st.caption("SQLite safe mode is ON: queue writes are serialized (effective workers = 1) to avoid database lock errors.")
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
@@ -3070,6 +3087,10 @@ with ui_tabs[0]:
     if recovered_rows:
         st.warning(f"Recovered {recovered_rows} stale in-progress queue rows back to pending.")
 
+    effective_bg_workers = 16 if bg_high_speed else int(bg_workers)
+    if bg_high_speed:
+        st.caption("High speed mode enabled: using single-provider first-hit strategy with 16 workers for maximum throughput.")
+
     if b1.button("📥 Add file to queue", key="bg_enqueue_btn"):
         out = enqueue_scrub_queue_from_upload(bg_file)
         if out.get("error"):
@@ -3091,8 +3112,8 @@ with ui_tabs[0]:
                     digikey_secret=bg_dk_secret,
                     digikey_scope=bg_dk_scope,
                     fill_empty_from_fallback=(False if bg_high_speed else bg_fill_empty),
-                    max_workers=int(bg_workers),
-                    internal_chunk_size=(1200 if bg_high_speed else 400),
+                    max_workers=effective_bg_workers,
+                    internal_chunk_size=0,
                 )
                 if processed:
                     if any(str(x.get("status", "")).lower() == "limit_reached" for x in processed if isinstance(x, dict)):
@@ -3115,8 +3136,8 @@ with ui_tabs[0]:
             digikey_secret=bg_dk_secret,
             digikey_scope=bg_dk_scope,
             fill_empty_from_fallback=(False if bg_high_speed else bg_fill_empty),
-            max_workers=int(bg_workers),
-            internal_chunk_size=(1200 if bg_high_speed else 400),
+            max_workers=effective_bg_workers,
+            internal_chunk_size=0,
         )
         if not all_processed:
             st.info("No pending queue rows. Queue is idle.")
