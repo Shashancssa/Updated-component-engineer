@@ -77,7 +77,7 @@ DEFAULT_MOUSER_DAILY_LIMIT = int(os.getenv("MOUSER_DAILY_LIMIT", "20000") or 200
 DEFAULT_DIGIKEY_DAILY_LIMIT = int(os.getenv("DIGIKEY_DAILY_LIMIT", "50000") or 50000)
 DEFAULT_MOUSER_MIN_INTERVAL_SEC = float(os.getenv("MOUSER_MIN_INTERVAL_SEC", "0.6") or 0.6)
 DEFAULT_DIGIKEY_MIN_INTERVAL_SEC = float(os.getenv("DIGIKEY_MIN_INTERVAL_SEC", "0.2") or 0.2)
-SQLITE_QUEUE_SERIAL_MODE = str(os.getenv("SQLITE_QUEUE_SERIAL_MODE", "1")).strip().lower() not in {"0", "false", "no"}
+SQLITE_QUEUE_SERIAL_MODE = str(os.getenv("SQLITE_QUEUE_SERIAL_MODE", "0")).strip().lower() not in {"0", "false", "no"}
 
 st.set_page_config(layout="wide", page_title="COMPONENT ENGINEER DATABASE", page_icon="🛡️")
 
@@ -814,9 +814,30 @@ def fetch_digikey_part_data(
     parameters = product.get("Parameters") if isinstance(product.get("Parameters"), list) else []
     lifecycle_status = _digikey_lifecycle(product, parameters)
 
-    manufacturer_pn = _dk_text(product.get("ManufacturerPartNumber", ""))
+    manufacturer_pn = _dk_text(
+        product.get("ManufacturerProductNumber", "")
+        or product.get("ManufacturerPartNumber", "")
+    )
     digikey_pn = _dk_text(product.get("DigiKeyPartNumber", ""))
     preferred_ref = manufacturer_pn or digikey_pn
+    description_obj = product.get("Description", {}) if isinstance(product.get("Description", {}), dict) else {}
+    dk_description = _dk_text(
+        description_obj.get("ProductDescription", "")
+        or description_obj.get("DetailedDescription", "")
+        or product.get("ProductDescription", "")
+        or product.get("Description", "")
+    )
+    classifications = product.get("Classifications", {}) if isinstance(product.get("Classifications", {}), dict) else {}
+    rohs_status = _dk_text(
+        product.get("RohsStatus", "")
+        or product.get("RoHSStatus", "")
+        or classifications.get("RohsStatus", "")
+        or classifications.get("RoHSStatus", "")
+    )
+    if not rohs_status:
+        rohs_compliant = product.get("RoHSCompliant", product.get("RohsCompliant", ""))
+        if isinstance(rohs_compliant, bool):
+            rohs_status = "RoHS Compliant" if rohs_compliant else "RoHS Non-Compliant"
 
     part_row = {
         "Requested MPN": str(part_number).strip(),
@@ -824,14 +845,14 @@ def fetch_digikey_part_data(
         "Manufacturer Part Number": manufacturer_pn,
         "Digi-Key Part Number": digikey_pn,
         "Manufacturer": _dk_text((product.get("Manufacturer", {}) or {}).get("Name", "") if isinstance(product.get("Manufacturer", {}), dict) else product.get("Manufacturer", "")),
-        "Description": _dk_text(product.get("ProductDescription", "") or product.get("Description", "")),
+        "Description": dk_description,
         "Category": _dk_text((product.get("Category", {}) or {}).get("Name", "") if isinstance(product.get("Category", {}), dict) else product.get("Category", "")),
         "Lifecycle Status": lifecycle_status,
         "Quantity Available": _dk_text(product.get("QuantityAvailable", "")),
         "Lead Time Weeks": _dk_text(product.get("ManufacturerLeadWeeks", "")),
         "Product URL": _dk_text(product.get("ProductUrl", "")),
         "Data Sheet URL": _dk_text(product.get("DatasheetUrl", "")),
-        "RoHS": _dk_text(product.get("RoHSStatus", "")),
+        "RoHS": rohs_status,
     }
 
     pricing_rows = []
@@ -860,6 +881,21 @@ def fetch_digikey_part_data(
                 "Value": a.get("ValueText", "") or a.get("Value", ""),
             }
         )
+    for attr_name, attr_val in [
+        ("RoHS Status", rohs_status),
+        ("REACH Status", _dk_text(classifications.get("ReachStatus", "") or product.get("ReachStatus", ""))),
+        ("ECCN", _dk_text(classifications.get("ExportControlClassNumber", "") or product.get("ExportControlClassNumber", ""))),
+        ("HTSUS Code", _dk_text(classifications.get("HtsusCode", "") or product.get("HtsusCode", ""))),
+    ]:
+        if str(attr_val).strip():
+            attribute_rows.append(
+                {
+                    "Requested MPN": str(part_number).strip(),
+                    "Supplier Part Number": part_row["Supplier Part Number"],
+                    "Attribute": attr_name,
+                    "Value": attr_val,
+                }
+            )
 
     docs_rows = []
     if part_row["Data Sheet URL"]:
@@ -2604,28 +2640,41 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
         ).fetchall()
         mpns = [str(r[0]).strip() for r in rows if str(r[0]).strip()]
 
+    max_workers = max(1, min(int(max_workers or 1), 16))
+    if SQLITE_QUEUE_SERIAL_MODE:
+        max_workers = 1
+
     for i, mpn in enumerate(mpns, start=1):
         now_utc = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
             conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, mpn))
             conn.commit()
-        log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Queue item {i}/{len(mpns)} started.")
+        log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Queue item started (position {i}).")
+
+    def _queue_worker(one_mpn, zero_idx):
         try:
             out = fetch_live_into_db_for_mpn(
-                mpn,
+                one_mpn,
                 mouser_key=mouser_key,
                 digikey_id=digikey_id,
                 digikey_secret=digikey_secret,
                 digikey_scope=digikey_scope,
-                priority_order=_rotating_priority_for_index(i - 1, split_mode=False),
+                priority_order=_rotating_priority_for_index(zero_idx, split_mode=False),
                 save_to_cells=True,
                 fill_empty_from_fallback=fill_empty_from_fallback,
             )
             if not isinstance(out, dict):
-                out = {"mpn": mpn, "status": "error", "error": "Invalid worker result type"}
+                out = {"mpn": one_mpn, "status": "error", "error": "Invalid worker result type"}
         except Exception as exn:
-            out = {"mpn": mpn, "status": "error", "error": str(exn)}
+            out = {"mpn": one_mpn, "status": "error", "error": str(exn)}
+        return out
 
+    if max_workers > 1 and len(mpns) > 1:
+        worker_rows = process_mpns_concurrently(mpns, _queue_worker, max_workers=max_workers)
+    else:
+        worker_rows = [_queue_worker(mpn, idx) for idx, mpn in enumerate(mpns)]
+
+    for out in worker_rows:
         mpn = str(out.get("mpn", "")).strip()
         if not mpn:
             continue
@@ -2760,9 +2809,11 @@ def requeue_stale_in_progress_rows(stale_seconds=300):
     return changed
 
 
-def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=400):
+def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=0):
     """Drain the full pending/error queue without exposing batch controls in UI."""
     all_rows = []
+    if not internal_chunk_size or int(internal_chunk_size) <= 0:
+        internal_chunk_size = max(100, int(max_workers or 1) * 20)
     while True:
         one_round = process_scrub_queue_batch(
             batch_size=int(internal_chunk_size),
@@ -3036,7 +3087,7 @@ with ui_tabs[0]:
                     digikey_scope=bg_dk_scope,
                     fill_empty_from_fallback=(False if bg_high_speed else bg_fill_empty),
                     max_workers=int(bg_workers),
-                    internal_chunk_size=(1200 if bg_high_speed else 400),
+                    internal_chunk_size=0,
                 )
                 if processed:
                     if any(str(x.get("status", "")).lower() == "limit_reached" for x in processed if isinstance(x, dict)):
@@ -3055,7 +3106,7 @@ with ui_tabs[0]:
             digikey_scope=bg_dk_scope,
             fill_empty_from_fallback=(False if bg_high_speed else bg_fill_empty),
             max_workers=int(bg_workers),
-            internal_chunk_size=(1200 if bg_high_speed else 400),
+            internal_chunk_size=0,
         )
         if not all_processed:
             st.info("No pending queue rows. Queue is idle.")
