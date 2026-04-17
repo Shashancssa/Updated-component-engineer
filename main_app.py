@@ -79,6 +79,7 @@ DEFAULT_MOUSER_MIN_INTERVAL_SEC = float(os.getenv("MOUSER_MIN_INTERVAL_SEC", "0.
 DEFAULT_DIGIKEY_MIN_INTERVAL_SEC = float(os.getenv("DIGIKEY_MIN_INTERVAL_SEC", "0.2") or 0.2)
 SQLITE_QUEUE_SERIAL_MODE = str(os.getenv("SQLITE_QUEUE_SERIAL_MODE", "0")).strip().lower() not in {"0", "false", "no"}
 QUEUE_STALE_RECOVERY_SECONDS = int(os.getenv("QUEUE_STALE_RECOVERY_SECONDS", "1800") or 1800)
+MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_WORKERS", "48") or 48)
 
 st.set_page_config(layout="wide", page_title="COMPONENT ENGINEER DATABASE", page_icon="🛡️")
 
@@ -2581,7 +2582,7 @@ def process_mpns_concurrently(mpns, worker_fn, max_workers=4):
     ordered = [x for x in ordered if x]
     if not ordered:
         return []
-    max_workers = max(1, min(int(max_workers or 1), 16, len(ordered)))
+    max_workers = max(1, min(int(max_workers or 1), MAX_PARALLEL_WORKERS, len(ordered)))
     results_map = {}
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         future_map = {ex.submit(worker_fn, mpn, idx): (idx, mpn) for idx, mpn in enumerate(ordered)}
@@ -2667,7 +2668,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
         ).fetchall()
         mpns = [str(r[0]).strip() for r in rows if str(r[0]).strip()]
 
-    max_workers = max(1, min(int(max_workers or 1), 16))
+    max_workers = max(1, min(int(max_workers or 1), MAX_PARALLEL_WORKERS))
     if SQLITE_QUEUE_SERIAL_MODE:
         max_workers = 1
 
@@ -3046,6 +3047,7 @@ with ui_tabs[0]:
         f"Digi-Key {DEFAULT_DIGIKEY_DAILY_LIMIT}/day @ {DEFAULT_DIGIKEY_MIN_INTERVAL_SEC:.1f}s min gap (UTC reset). "
         "Override via env: MOUSER_DAILY_LIMIT, DIGIKEY_DAILY_LIMIT, MOUSER_MIN_INTERVAL_SEC, DIGIKEY_MIN_INTERVAL_SEC."
     )
+    st.caption(f"Parallel worker cap is {MAX_PARALLEL_WORKERS} (override via env: MAX_PARALLEL_WORKERS).")
     live_up = st.file_uploader("Upload MPN List for Live Combo Scraper", type=["xlsx", "csv"], key="live_combo_upload")
     live_manual = st.text_area("Or enter MPNs (comma/newline separated)", key="live_combo_manual")
     lc1, lc2 = st.columns(2)
@@ -3055,7 +3057,7 @@ with ui_tabs[0]:
     live_mouser = lc2.text_input("Mouser API Key (Optional)", value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK), type="password", key="live_combo_mouser")
     live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Mouser)", value=False, key="live_combo_split_mode")
     live_high_speed = st.toggle("🚀 High Speed Mode (Digi-Key first hit, reduced fallback merge)", value=False, key="live_combo_high_speed")
-    live_workers = st.number_input("Live combo parallel workers", min_value=1, max_value=16, value=8, step=1, key="live_combo_workers")
+    live_workers = st.number_input("Live combo parallel workers", min_value=1, max_value=MAX_PARALLEL_WORKERS, value=12, step=1, key="live_combo_workers")
     st.caption("Tip: Use 4-8 workers to target ~30+ MPN/min, based on API/network response time.")
     live_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="live_combo_fill_empty")
     if st.button("Start Live Combo Scraper", key="live_combo_run"):
@@ -3110,7 +3112,7 @@ with ui_tabs[0]:
     bg_dk_scope = bgc1.text_input("Queue Digi-Key Scope", value=os.getenv("DIGIKEY_SCOPE", ""), key="bg_dk_scope")
     bg_fill_empty = bgc2.toggle("Queue fallback fill empty fields", value=True, key="bg_fill_empty")
     bg_high_speed = bgc2.toggle("🚀 Queue High Speed Mode (Digi-Key first hit)", value=False, key="bg_high_speed")
-    bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=16, value=16, step=1, key="bg_workers")
+    bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=MAX_PARALLEL_WORKERS, value=min(32, MAX_PARALLEL_WORKERS), step=1, key="bg_workers")
     if SQLITE_QUEUE_SERIAL_MODE:
         st.caption("SQLite safe mode is ON: queue writes are serialized (effective workers = 1) to avoid database lock errors.")
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
@@ -3140,9 +3142,9 @@ with ui_tabs[0]:
         st.warning(f"Recovered {recovered_rows} stale in-progress queue rows back to pending.")
     st.caption(f"Stale in-progress auto-recovery window: {QUEUE_STALE_RECOVERY_SECONDS} seconds.")
 
-    effective_bg_workers = 16 if bg_high_speed else int(bg_workers)
+    effective_bg_workers = min(MAX_PARALLEL_WORKERS, max(32, int(bg_workers))) if bg_high_speed else int(bg_workers)
     if bg_high_speed:
-        st.caption("High speed mode enabled: using single-provider first-hit strategy with 16 workers for maximum throughput.")
+        st.caption(f"High speed mode enabled: using single-provider first-hit strategy with {effective_bg_workers} workers for maximum throughput.")
 
     if b1.button("📥 Add file to queue", key="bg_enqueue_btn"):
         out = enqueue_scrub_queue_from_upload(bg_file)
