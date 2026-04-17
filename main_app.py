@@ -3058,6 +3058,16 @@ with ui_tabs[0]:
     if SQLITE_QUEUE_SERIAL_MODE:
         st.caption("SQLite safe mode is ON: queue writes are serialized (effective workers = 1) to avoid database lock errors.")
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
+    auto_run_threshold = int(
+        bgc2.number_input(
+            "Auto-run threshold (queued MPNs)",
+            min_value=1,
+            max_value=50000,
+            value=50,
+            step=1,
+            key="bg_auto_run_threshold",
+        )
+    )
 
     bg_file = st.file_uploader("Upload full MPN file (col1=MPN, col2=Manufacturer/Make optional)", type=["xlsx", "csv"], key="bg_queue_upload")
     b1, b2, b3 = st.columns(3)
@@ -3079,7 +3089,15 @@ with ui_tabs[0]:
             st.error(out["error"])
         else:
             st.success(f"Queued {out['queued']} MPNs. Skipped {out['skipped']} duplicates/blank rows.")
-            if auto_run_on_enqueue and int(out.get("queued", 0) or 0) > 0:
+            pending_for_auto_run = 0
+            with sqlite3.connect(DB_PATH) as conn:
+                pending_for_auto_run = int(
+                    conn.execute(
+                        "SELECT COUNT(1) FROM scrub_queue WHERE status IN ('pending', 'error', 'in_progress')"
+                    ).fetchone()[0]
+                    or 0
+                )
+            if auto_run_on_enqueue and pending_for_auto_run >= auto_run_threshold:
                 processed = process_scrub_queue_all(
                     mouser_key=bg_mouser,
                     digikey_id=bg_dk_id,
@@ -3096,6 +3114,11 @@ with ui_tabs[0]:
                     st.dataframe(pd.DataFrame(processed), width="stretch")
                 else:
                     st.info("Auto-run was enabled, but no pending rows were available.")
+            elif auto_run_on_enqueue:
+                st.info(
+                    f"Auto-run waiting: queued/in-progress count is {pending_for_auto_run}, "
+                    f"threshold is {auto_run_threshold}. Add more MPNs or click 'Run queue now'."
+                )
 
     if run_batch:
         start_ts = time.time()
