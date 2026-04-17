@@ -814,9 +814,30 @@ def fetch_digikey_part_data(
     parameters = product.get("Parameters") if isinstance(product.get("Parameters"), list) else []
     lifecycle_status = _digikey_lifecycle(product, parameters)
 
-    manufacturer_pn = _dk_text(product.get("ManufacturerPartNumber", ""))
+    manufacturer_pn = _dk_text(
+        product.get("ManufacturerProductNumber", "")
+        or product.get("ManufacturerPartNumber", "")
+    )
     digikey_pn = _dk_text(product.get("DigiKeyPartNumber", ""))
     preferred_ref = manufacturer_pn or digikey_pn
+    description_obj = product.get("Description", {}) if isinstance(product.get("Description", {}), dict) else {}
+    dk_description = _dk_text(
+        description_obj.get("ProductDescription", "")
+        or description_obj.get("DetailedDescription", "")
+        or product.get("ProductDescription", "")
+        or product.get("Description", "")
+    )
+    classifications = product.get("Classifications", {}) if isinstance(product.get("Classifications", {}), dict) else {}
+    rohs_status = _dk_text(
+        product.get("RohsStatus", "")
+        or product.get("RoHSStatus", "")
+        or classifications.get("RohsStatus", "")
+        or classifications.get("RoHSStatus", "")
+    )
+    if not rohs_status:
+        rohs_compliant = product.get("RoHSCompliant", product.get("RohsCompliant", ""))
+        if isinstance(rohs_compliant, bool):
+            rohs_status = "RoHS Compliant" if rohs_compliant else "RoHS Non-Compliant"
 
     part_row = {
         "Requested MPN": str(part_number).strip(),
@@ -824,14 +845,14 @@ def fetch_digikey_part_data(
         "Manufacturer Part Number": manufacturer_pn,
         "Digi-Key Part Number": digikey_pn,
         "Manufacturer": _dk_text((product.get("Manufacturer", {}) or {}).get("Name", "") if isinstance(product.get("Manufacturer", {}), dict) else product.get("Manufacturer", "")),
-        "Description": _dk_text(product.get("ProductDescription", "") or product.get("Description", "")),
+        "Description": dk_description,
         "Category": _dk_text((product.get("Category", {}) or {}).get("Name", "") if isinstance(product.get("Category", {}), dict) else product.get("Category", "")),
         "Lifecycle Status": lifecycle_status,
         "Quantity Available": _dk_text(product.get("QuantityAvailable", "")),
         "Lead Time Weeks": _dk_text(product.get("ManufacturerLeadWeeks", "")),
         "Product URL": _dk_text(product.get("ProductUrl", "")),
         "Data Sheet URL": _dk_text(product.get("DatasheetUrl", "")),
-        "RoHS": _dk_text(product.get("RoHSStatus", "")),
+        "RoHS": rohs_status,
     }
 
     pricing_rows = []
@@ -860,6 +881,21 @@ def fetch_digikey_part_data(
                 "Value": a.get("ValueText", "") or a.get("Value", ""),
             }
         )
+    for attr_name, attr_val in [
+        ("RoHS Status", rohs_status),
+        ("REACH Status", _dk_text(classifications.get("ReachStatus", "") or product.get("ReachStatus", ""))),
+        ("ECCN", _dk_text(classifications.get("ExportControlClassNumber", "") or product.get("ExportControlClassNumber", ""))),
+        ("HTSUS Code", _dk_text(classifications.get("HtsusCode", "") or product.get("HtsusCode", ""))),
+    ]:
+        if str(attr_val).strip():
+            attribute_rows.append(
+                {
+                    "Requested MPN": str(part_number).strip(),
+                    "Supplier Part Number": part_row["Supplier Part Number"],
+                    "Attribute": attr_name,
+                    "Value": attr_val,
+                }
+            )
 
     docs_rows = []
     if part_row["Data Sheet URL"]:
@@ -2617,7 +2653,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 digikey_id=digikey_id,
                 digikey_secret=digikey_secret,
                 digikey_scope=digikey_scope,
-                priority_order=_rotating_priority_for_index(i - 1, split_mode=False),
+                priority_order=_rotating_priority_for_index(zero_idx, split_mode=False),
                 save_to_cells=True,
                 fill_empty_from_fallback=fill_empty_from_fallback,
             )
@@ -2763,6 +2799,8 @@ def requeue_stale_in_progress_rows(stale_seconds=300):
 def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=400):
     """Drain the full pending/error queue without exposing batch controls in UI."""
     all_rows = []
+    if not internal_chunk_size or int(internal_chunk_size) <= 0:
+        internal_chunk_size = max(200, int(max_workers or 1) * 40)
     while True:
         one_round = process_scrub_queue_batch(
             batch_size=int(internal_chunk_size),
@@ -3007,6 +3045,16 @@ with ui_tabs[0]:
     if SQLITE_QUEUE_SERIAL_MODE:
         st.caption("SQLite safe mode is ON: queue writes are serialized (effective workers = 1) to avoid database lock errors.")
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
+    auto_run_threshold = int(
+        bgc2.number_input(
+            "Auto-run threshold (queued MPNs)",
+            min_value=1,
+            max_value=50000,
+            value=50,
+            step=1,
+            key="bg_auto_run_threshold",
+        )
+    )
 
     bg_file = st.file_uploader("Upload full MPN file (col1=MPN, col2=Manufacturer/Make optional)", type=["xlsx", "csv"], key="bg_queue_upload")
     b1, b2, b3 = st.columns(3)
@@ -3028,7 +3076,15 @@ with ui_tabs[0]:
             st.error(out["error"])
         else:
             st.success(f"Queued {out['queued']} MPNs. Skipped {out['skipped']} duplicates/blank rows.")
-            if auto_run_on_enqueue and int(out.get("queued", 0) or 0) > 0:
+            pending_for_auto_run = 0
+            with sqlite3.connect(DB_PATH) as conn:
+                pending_for_auto_run = int(
+                    conn.execute(
+                        "SELECT COUNT(1) FROM scrub_queue WHERE status IN ('pending', 'error', 'in_progress')"
+                    ).fetchone()[0]
+                    or 0
+                )
+            if auto_run_on_enqueue and pending_for_auto_run >= auto_run_threshold:
                 processed = process_scrub_queue_all(
                     mouser_key=bg_mouser,
                     digikey_id=bg_dk_id,
@@ -3045,6 +3101,11 @@ with ui_tabs[0]:
                     st.dataframe(pd.DataFrame(processed), width="stretch")
                 else:
                     st.info("Auto-run was enabled, but no pending rows were available.")
+            elif auto_run_on_enqueue:
+                st.info(
+                    f"Auto-run waiting: queued/in-progress count is {pending_for_auto_run}, "
+                    f"threshold is {auto_run_threshold}. Add more MPNs or click 'Run queue now'."
+                )
 
     if run_batch:
         start_ts = time.time()
