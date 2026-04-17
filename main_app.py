@@ -78,6 +78,7 @@ DEFAULT_DIGIKEY_DAILY_LIMIT = int(os.getenv("DIGIKEY_DAILY_LIMIT", "50000") or 5
 DEFAULT_MOUSER_MIN_INTERVAL_SEC = float(os.getenv("MOUSER_MIN_INTERVAL_SEC", "0.6") or 0.6)
 DEFAULT_DIGIKEY_MIN_INTERVAL_SEC = float(os.getenv("DIGIKEY_MIN_INTERVAL_SEC", "0.2") or 0.2)
 SQLITE_QUEUE_SERIAL_MODE = str(os.getenv("SQLITE_QUEUE_SERIAL_MODE", "0")).strip().lower() not in {"0", "false", "no"}
+QUEUE_STALE_RECOVERY_SECONDS = int(os.getenv("QUEUE_STALE_RECOVERY_SECONDS", "1800") or 1800)
 
 st.set_page_config(layout="wide", page_title="COMPONENT ENGINEER DATABASE", page_icon="🛡️")
 
@@ -2470,24 +2471,41 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
                 provider_tasks[str(provider).strip().lower()] = task
 
         if provider_tasks:
-            with ThreadPoolExecutor(max_workers=max(1, len(provider_tasks))) as executor:
-                future_map = {
-                    executor.submit(_call_with_retry, task): provider_key
-                    for provider_key, task in provider_tasks.items()
-                }
-                for future in as_completed(future_map):
-                    provider_key = future_map[future]
+            if not fill_empty_from_fallback:
+                # High-throughput mode: avoid parallel multi-provider calls for same MPN.
+                for provider in provider_order:
+                    provider_key = str(provider).strip().lower()
+                    task = provider_tasks.get(provider_key)
+                    if not task:
+                        continue
                     provider_name = provider_name_map.get(provider_key, provider_key)
-                    try:
-                        payload, err = future.result()
-                    except Exception as ex:
-                        payload, err = None, str(ex)
+                    payload, err = _call_with_retry(task, max_attempts=1, retry_delay=0.15)
                     if payload and isinstance(payload, dict) and payload.get("parts"):
                         payload_by_provider[provider_key] = payload
-                    elif err:
+                        break
+                    if err:
                         provider_errors.append(f"{provider_name}: {str(err)[:220]}")
                     else:
                         provider_errors.append(f"{provider_name}: no match")
+            else:
+                with ThreadPoolExecutor(max_workers=max(1, len(provider_tasks))) as executor:
+                    future_map = {
+                        executor.submit(_call_with_retry, task): provider_key
+                        for provider_key, task in provider_tasks.items()
+                    }
+                    for future in as_completed(future_map):
+                        provider_key = future_map[future]
+                        provider_name = provider_name_map.get(provider_key, provider_key)
+                        try:
+                            payload, err = future.result()
+                        except Exception as ex:
+                            payload, err = None, str(ex)
+                        if payload and isinstance(payload, dict) and payload.get("parts"):
+                            payload_by_provider[provider_key] = payload
+                        elif err:
+                            provider_errors.append(f"{provider_name}: {str(err)[:220]}")
+                        else:
+                            provider_errors.append(f"{provider_name}: no match")
 
         payloads = []
         sources = []
@@ -2644,14 +2662,17 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
     if SQLITE_QUEUE_SERIAL_MODE:
         max_workers = 1
 
-    for i, mpn in enumerate(mpns, start=1):
+    def _queue_worker(one_mpn, zero_idx):
         now_utc = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
-            conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, mpn))
+            conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, one_mpn))
             conn.commit()
-        log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Queue item started (position {i}).")
-
-    def _queue_worker(one_mpn, zero_idx):
+        log_scrub_history(
+            one_mpn,
+            step="process_start",
+            status="in_progress",
+            message=f"Queue item started (position {zero_idx + 1}).",
+        )
         try:
             out = fetch_live_into_db_for_mpn(
                 one_mpn,
@@ -2813,7 +2834,7 @@ def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", dig
     """Drain the full pending/error queue without exposing batch controls in UI."""
     all_rows = []
     if not internal_chunk_size or int(internal_chunk_size) <= 0:
-        internal_chunk_size = max(100, int(max_workers or 1) * 20)
+        internal_chunk_size = max(200, int(max_workers or 1) * 40)
     while True:
         one_round = process_scrub_queue_batch(
             batch_size=int(internal_chunk_size),
@@ -3054,10 +3075,20 @@ with ui_tabs[0]:
     bg_dk_scope = bgc1.text_input("Queue Digi-Key Scope", value=os.getenv("DIGIKEY_SCOPE", ""), key="bg_dk_scope")
     bg_fill_empty = bgc2.toggle("Queue fallback fill empty fields", value=True, key="bg_fill_empty")
     bg_high_speed = bgc2.toggle("🚀 Queue High Speed Mode (Digi-Key first hit)", value=False, key="bg_high_speed")
-    bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=16, value=8, step=1, key="bg_workers")
+    bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=16, value=16, step=1, key="bg_workers")
     if SQLITE_QUEUE_SERIAL_MODE:
         st.caption("SQLite safe mode is ON: queue writes are serialized (effective workers = 1) to avoid database lock errors.")
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
+    auto_run_threshold = int(
+        bgc2.number_input(
+            "Auto-run threshold (queued MPNs)",
+            min_value=1,
+            max_value=50000,
+            value=50,
+            step=1,
+            key="bg_auto_run_threshold",
+        )
+    )
 
     bg_file = st.file_uploader("Upload full MPN file (col1=MPN, col2=Manufacturer/Make optional)", type=["xlsx", "csv"], key="bg_queue_upload")
     b1, b2, b3 = st.columns(3)
@@ -3069,9 +3100,14 @@ with ui_tabs[0]:
             st.success(f"Reset {moved} in-progress rows back to pending.")
         else:
             st.info("No in-progress rows needed reset.")
-    recovered_rows = requeue_stale_in_progress_rows(stale_seconds=300)
+    recovered_rows = requeue_stale_in_progress_rows(stale_seconds=QUEUE_STALE_RECOVERY_SECONDS)
     if recovered_rows:
         st.warning(f"Recovered {recovered_rows} stale in-progress queue rows back to pending.")
+    st.caption(f"Stale in-progress auto-recovery window: {QUEUE_STALE_RECOVERY_SECONDS} seconds.")
+
+    effective_bg_workers = 16 if bg_high_speed else int(bg_workers)
+    if bg_high_speed:
+        st.caption("High speed mode enabled: using single-provider first-hit strategy with 16 workers for maximum throughput.")
 
     if b1.button("📥 Add file to queue", key="bg_enqueue_btn"):
         out = enqueue_scrub_queue_from_upload(bg_file)
@@ -3079,14 +3115,22 @@ with ui_tabs[0]:
             st.error(out["error"])
         else:
             st.success(f"Queued {out['queued']} MPNs. Skipped {out['skipped']} duplicates/blank rows.")
-            if auto_run_on_enqueue and int(out.get("queued", 0) or 0) > 0:
+            pending_for_auto_run = 0
+            with sqlite3.connect(DB_PATH) as conn:
+                pending_for_auto_run = int(
+                    conn.execute(
+                        "SELECT COUNT(1) FROM scrub_queue WHERE status IN ('pending', 'error', 'in_progress')"
+                    ).fetchone()[0]
+                    or 0
+                )
+            if auto_run_on_enqueue and pending_for_auto_run >= auto_run_threshold:
                 processed = process_scrub_queue_all(
                     mouser_key=bg_mouser,
                     digikey_id=bg_dk_id,
                     digikey_secret=bg_dk_secret,
                     digikey_scope=bg_dk_scope,
                     fill_empty_from_fallback=(False if bg_high_speed else bg_fill_empty),
-                    max_workers=int(bg_workers),
+                    max_workers=effective_bg_workers,
                     internal_chunk_size=0,
                 )
                 if processed:
@@ -3096,6 +3140,11 @@ with ui_tabs[0]:
                     st.dataframe(pd.DataFrame(processed), width="stretch")
                 else:
                     st.info("Auto-run was enabled, but no pending rows were available.")
+            elif auto_run_on_enqueue:
+                st.info(
+                    f"Auto-run waiting: queued/in-progress count is {pending_for_auto_run}, "
+                    f"threshold is {auto_run_threshold}. Add more MPNs or click 'Run queue now'."
+                )
 
     if run_batch:
         start_ts = time.time()
@@ -3105,7 +3154,7 @@ with ui_tabs[0]:
             digikey_secret=bg_dk_secret,
             digikey_scope=bg_dk_scope,
             fill_empty_from_fallback=(False if bg_high_speed else bg_fill_empty),
-            max_workers=int(bg_workers),
+            max_workers=effective_bg_workers,
             internal_chunk_size=0,
         )
         if not all_processed:
