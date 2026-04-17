@@ -77,8 +77,7 @@ DEFAULT_MOUSER_DAILY_LIMIT = int(os.getenv("MOUSER_DAILY_LIMIT", "20000") or 200
 DEFAULT_DIGIKEY_DAILY_LIMIT = int(os.getenv("DIGIKEY_DAILY_LIMIT", "50000") or 50000)
 DEFAULT_MOUSER_MIN_INTERVAL_SEC = float(os.getenv("MOUSER_MIN_INTERVAL_SEC", "0.6") or 0.6)
 DEFAULT_DIGIKEY_MIN_INTERVAL_SEC = float(os.getenv("DIGIKEY_MIN_INTERVAL_SEC", "0.2") or 0.2)
-SQLITE_QUEUE_SERIAL_MODE = str(os.getenv("SQLITE_QUEUE_SERIAL_MODE", "0")).strip().lower() not in {"0", "false", "no"}
-QUEUE_STALE_RECOVERY_SECONDS = int(os.getenv("QUEUE_STALE_RECOVERY_SECONDS", "1800") or 1800)
+SQLITE_QUEUE_SERIAL_MODE = str(os.getenv("SQLITE_QUEUE_SERIAL_MODE", "1")).strip().lower() not in {"0", "false", "no"}
 
 st.set_page_config(layout="wide", page_title="COMPONENT ENGINEER DATABASE", page_icon="🛡️")
 
@@ -2641,24 +2640,15 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
         ).fetchall()
         mpns = [str(r[0]).strip() for r in rows if str(r[0]).strip()]
 
-    max_workers = max(1, min(int(max_workers or 1), 16))
-    if SQLITE_QUEUE_SERIAL_MODE:
-        max_workers = 1
-
-    def _queue_worker(one_mpn, zero_idx):
+    for i, mpn in enumerate(mpns, start=1):
         now_utc = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
-            conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, one_mpn))
+            conn.execute("UPDATE scrub_queue SET status='in_progress', updated_at_utc=? WHERE mpn=?", (now_utc, mpn))
             conn.commit()
-        log_scrub_history(
-            one_mpn,
-            step="process_start",
-            status="in_progress",
-            message=f"Queue item started (position {zero_idx + 1}).",
-        )
+        log_scrub_history(mpn, step="process_start", status="in_progress", message=f"Queue item {i}/{len(mpns)} started.")
         try:
             out = fetch_live_into_db_for_mpn(
-                one_mpn,
+                mpn,
                 mouser_key=mouser_key,
                 digikey_id=digikey_id,
                 digikey_secret=digikey_secret,
@@ -2668,17 +2658,10 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 fill_empty_from_fallback=fill_empty_from_fallback,
             )
             if not isinstance(out, dict):
-                out = {"mpn": one_mpn, "status": "error", "error": "Invalid worker result type"}
+                out = {"mpn": mpn, "status": "error", "error": "Invalid worker result type"}
         except Exception as exn:
-            out = {"mpn": one_mpn, "status": "error", "error": str(exn)}
-        return out
+            out = {"mpn": mpn, "status": "error", "error": str(exn)}
 
-    if max_workers > 1 and len(mpns) > 1:
-        worker_rows = process_mpns_concurrently(mpns, _queue_worker, max_workers=max_workers)
-    else:
-        worker_rows = [_queue_worker(mpn, idx) for idx, mpn in enumerate(mpns)]
-
-    for out in worker_rows:
         mpn = str(out.get("mpn", "")).strip()
         if not mpn:
             continue
@@ -2813,7 +2796,7 @@ def requeue_stale_in_progress_rows(stale_seconds=300):
     return changed
 
 
-def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=0):
+def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=400):
     """Drain the full pending/error queue without exposing batch controls in UI."""
     all_rows = []
     if not internal_chunk_size or int(internal_chunk_size) <= 0:
@@ -3058,7 +3041,7 @@ with ui_tabs[0]:
     bg_dk_scope = bgc1.text_input("Queue Digi-Key Scope", value=os.getenv("DIGIKEY_SCOPE", ""), key="bg_dk_scope")
     bg_fill_empty = bgc2.toggle("Queue fallback fill empty fields", value=True, key="bg_fill_empty")
     bg_high_speed = bgc2.toggle("🚀 Queue High Speed Mode (Digi-Key first hit)", value=False, key="bg_high_speed")
-    bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=16, value=12, step=1, key="bg_workers")
+    bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=16, value=8, step=1, key="bg_workers")
     if SQLITE_QUEUE_SERIAL_MODE:
         st.caption("SQLite safe mode is ON: queue writes are serialized (effective workers = 1) to avoid database lock errors.")
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
@@ -3083,10 +3066,9 @@ with ui_tabs[0]:
             st.success(f"Reset {moved} in-progress rows back to pending.")
         else:
             st.info("No in-progress rows needed reset.")
-    recovered_rows = requeue_stale_in_progress_rows(stale_seconds=QUEUE_STALE_RECOVERY_SECONDS)
+    recovered_rows = requeue_stale_in_progress_rows(stale_seconds=300)
     if recovered_rows:
         st.warning(f"Recovered {recovered_rows} stale in-progress queue rows back to pending.")
-    st.caption(f"Stale in-progress auto-recovery window: {QUEUE_STALE_RECOVERY_SECONDS} seconds.")
 
     if b1.button("📥 Add file to queue", key="bg_enqueue_btn"):
         out = enqueue_scrub_queue_from_upload(bg_file)
@@ -3110,7 +3092,7 @@ with ui_tabs[0]:
                     digikey_scope=bg_dk_scope,
                     fill_empty_from_fallback=(False if bg_high_speed else bg_fill_empty),
                     max_workers=int(bg_workers),
-                    internal_chunk_size=0,
+                    internal_chunk_size=(1200 if bg_high_speed else 400),
                 )
                 if processed:
                     if any(str(x.get("status", "")).lower() == "limit_reached" for x in processed if isinstance(x, dict)):
@@ -3134,7 +3116,7 @@ with ui_tabs[0]:
             digikey_scope=bg_dk_scope,
             fill_empty_from_fallback=(False if bg_high_speed else bg_fill_empty),
             max_workers=int(bg_workers),
-            internal_chunk_size=0,
+            internal_chunk_size=(1200 if bg_high_speed else 400),
         )
         if not all_processed:
             st.info("No pending queue rows. Queue is idle.")
