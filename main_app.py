@@ -2675,7 +2675,7 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
         )
         try:
             out = fetch_live_into_db_for_mpn(
-                one_mpn,
+                mpn,
                 mouser_key=mouser_key,
                 digikey_id=digikey_id,
                 digikey_secret=digikey_secret,
@@ -2685,10 +2685,9 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 fill_empty_from_fallback=fill_empty_from_fallback,
             )
             if not isinstance(out, dict):
-                out = {"mpn": one_mpn, "status": "error", "error": "Invalid worker result type"}
+                out = {"mpn": mpn, "status": "error", "error": "Invalid worker result type"}
         except Exception as exn:
-            out = {"mpn": one_mpn, "status": "error", "error": str(exn)}
-        return out
+            out = {"mpn": mpn, "status": "error", "error": str(exn)}
 
     def _finalize_queue_result(out):
         stop_all = False
@@ -2846,7 +2845,7 @@ def requeue_stale_in_progress_rows(stale_seconds=300):
     return changed
 
 
-def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=0):
+def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=400):
     """Drain the full pending/error queue without exposing batch controls in UI."""
     all_rows = []
     if not internal_chunk_size or int(internal_chunk_size) <= 0:
@@ -3120,6 +3119,10 @@ with ui_tabs[0]:
     if recovered_rows:
         st.warning(f"Recovered {recovered_rows} stale in-progress queue rows back to pending.")
     st.caption(f"Stale in-progress auto-recovery window: {QUEUE_STALE_RECOVERY_SECONDS} seconds.")
+
+    effective_bg_workers = 16 if bg_high_speed else int(bg_workers)
+    if bg_high_speed:
+        st.caption("High speed mode enabled: using single-provider first-hit strategy with 16 workers for maximum throughput.")
 
     effective_bg_workers = 16 if bg_high_speed else int(bg_workers)
     if bg_high_speed:
