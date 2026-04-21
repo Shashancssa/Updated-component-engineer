@@ -222,6 +222,73 @@ def _extract_component_thickness(attributes):
     return ""
 
 
+def _is_passive_component(category_text, description_text):
+    hay = f"{category_text or ''} {description_text or ''}".lower()
+    return any(
+        key in hay
+        for key in [
+            "resistor",
+            "capacitor",
+            "inductor",
+            "ferrite",
+            "bead",
+            "thermistor",
+            "ntc",
+            "ptc",
+            "varistor",
+            "passive",
+        ]
+    )
+
+
+def _decoded_passive_description(row, attributes):
+    """
+    Build a normalized passive-part summary from distributor attributes.
+    This follows common datasheet ordering fields (value/tolerance/package/rating)
+    so passive MPN descriptions are human-readable and consistently decoded.
+    """
+    if not isinstance(row, dict):
+        return ""
+    category = str(row.get("Category", "") or row.get("category", "")).strip()
+    desc = str(row.get("Description", "") or row.get("description", "")).strip()
+    if not _is_passive_component(category, desc):
+        return ""
+
+    value = _extract_attribute_value(
+        attributes,
+        "resistance",
+        "capacitance",
+        "inductance",
+        "impedance",
+        "dc resistance",
+        "dcr",
+    )
+    tolerance = _extract_attribute_value(attributes, "tolerance")
+    package = _extract_attribute_value(attributes, "package", "case", "size / dimension")
+    rated = _extract_attribute_value(
+        attributes,
+        "voltage rated",
+        "rated voltage",
+        "power",
+        "power watts",
+        "current rating",
+    )
+    temp = _extract_attribute_value(attributes, "temperature coefficient", "temp coeff", "operating temperature")
+
+    tokens = [t for t in [value, tolerance, rated, package, temp] if str(t).strip()]
+    if not tokens:
+        return ""
+
+    # Keep the original description if it already contains rich details.
+    has_detail = any(sym in desc for sym in ["±", "Ω", "ohm", "F ", "H ", "V", "W", "%"])
+    decoded = " | ".join(tokens)
+    if desc and has_detail:
+        return desc
+    if desc:
+        return f"{desc} | {decoded}"
+    return decoded
+
+
 def normalize_mpn(value):
     txt = str(value or "").strip()
     if not txt:
@@ -278,6 +345,9 @@ def add_enrichment_fields(parts, attributes, pricing):
     for row in parts:
         if not isinstance(row, dict):
             continue
+        decoded_desc = _decoded_passive_description(row, attributes)
+        if decoded_desc:
+            row["Description"] = decoded_desc
         row["MSD LEVEL"] = row.get("MSD LEVEL", "") or msd
         row["REFLOW SOLDERING TEMPERATURE"] = row.get("REFLOW SOLDERING TEMPERATURE", "") or reflow
         row["THERMAL CYCLE"] = row.get("THERMAL CYCLE", "") or thermal_cycle
