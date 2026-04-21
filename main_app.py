@@ -53,6 +53,7 @@ NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "ECZ622yjXXrCVDp
 _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
 _API_LAST_CALL_TS = {}
+_API_USAGE_CACHE = {}
 
 def _is_api_limit_error_message(msg):
     text = str(msg or "").strip().lower()
@@ -75,8 +76,9 @@ def _is_api_limit_error_message(msg):
 
 DEFAULT_MOUSER_DAILY_LIMIT = int(os.getenv("MOUSER_DAILY_LIMIT", "20000") or 20000)
 DEFAULT_DIGIKEY_DAILY_LIMIT = int(os.getenv("DIGIKEY_DAILY_LIMIT", "50000") or 50000)
-DEFAULT_MOUSER_MIN_INTERVAL_SEC = float(os.getenv("MOUSER_MIN_INTERVAL_SEC", "0.6") or 0.6)
-DEFAULT_DIGIKEY_MIN_INTERVAL_SEC = float(os.getenv("DIGIKEY_MIN_INTERVAL_SEC", "0.2") or 0.2)
+DEFAULT_MOUSER_MIN_INTERVAL_SEC = float(os.getenv("MOUSER_MIN_INTERVAL_SEC", "0.30") or 0.30)
+DEFAULT_DIGIKEY_MIN_INTERVAL_SEC = float(os.getenv("DIGIKEY_MIN_INTERVAL_SEC", "0.10") or 0.10)
+API_USAGE_FLUSH_EVERY = int(os.getenv("API_USAGE_FLUSH_EVERY", "10") or 10)
 SQLITE_QUEUE_SERIAL_MODE = str(os.getenv("SQLITE_QUEUE_SERIAL_MODE", "0")).strip().lower() not in {"0", "false", "no"}
 QUEUE_STALE_RECOVERY_SECONDS = int(os.getenv("QUEUE_STALE_RECOVERY_SECONDS", "1800") or 1800)
 MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_WORKERS", "48") or 48)
@@ -111,36 +113,45 @@ def _enforce_api_policy(provider_key):
 
     with _API_LIMIT_LOCK:
         ensure_api_usage_table()
-        with sqlite3.connect(DB_PATH) as conn:
-            row = conn.execute(
-                "SELECT call_count FROM api_usage_daily WHERE provider=? AND usage_date_utc=?",
-                (provider, usage_date),
-            ).fetchone()
-            used = int(row[0]) if row else 0
-            if used >= int(daily_limit):
-                raise RuntimeError(
-                    f"{provider.title()} daily API limit reached ({used}/{daily_limit}) for UTC date {usage_date}. "
-                    "Resume after UTC day reset or increase limit via environment settings."
-                )
+        cache_key = (provider, usage_date)
+        used = _API_USAGE_CACHE.get(cache_key)
+        if used is None:
+            with connect_db() as conn:
+                row = conn.execute(
+                    "SELECT call_count FROM api_usage_daily WHERE provider=? AND usage_date_utc=?",
+                    (provider, usage_date),
+                ).fetchone()
+                used = int(row[0]) if row else 0
+            _API_USAGE_CACHE[cache_key] = used
 
-            now_ts = time.time()
-            last_ts = float(_API_LAST_CALL_TS.get(provider, 0.0) or 0.0)
-            wait_s = float(min_interval) - (now_ts - last_ts)
-            if wait_s > 0:
-                time.sleep(wait_s)
-
-            conn.execute(
-                """
-                INSERT INTO api_usage_daily (provider, usage_date_utc, call_count, updated_at_utc)
-                VALUES (?, ?, 1, ?)
-                ON CONFLICT(provider, usage_date_utc) DO UPDATE SET
-                    call_count = call_count + 1,
-                    updated_at_utc = excluded.updated_at_utc
-                """,
-                (provider, usage_date, datetime.now(timezone.utc).isoformat()),
+        if used >= int(daily_limit):
+            raise RuntimeError(
+                f"{provider.title()} daily API limit reached ({used}/{daily_limit}) for UTC date {usage_date}. "
+                "Resume after UTC day reset or increase limit via environment settings."
             )
-            conn.commit()
-            _API_LAST_CALL_TS[provider] = time.time()
+
+        now_ts = time.time()
+        last_ts = float(_API_LAST_CALL_TS.get(provider, 0.0) or 0.0)
+        wait_s = float(min_interval) - (now_ts - last_ts)
+        if wait_s > 0:
+            time.sleep(wait_s)
+
+        used = int(_API_USAGE_CACHE.get(cache_key, 0)) + 1
+        _API_USAGE_CACHE[cache_key] = used
+        if used % max(1, API_USAGE_FLUSH_EVERY) == 0:
+            with connect_db() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO api_usage_daily (provider, usage_date_utc, call_count, updated_at_utc)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(provider, usage_date_utc) DO UPDATE SET
+                        call_count = excluded.call_count,
+                        updated_at_utc = excluded.updated_at_utc
+                    """,
+                    (provider, usage_date, used, datetime.now(timezone.utc).isoformat()),
+                )
+                conn.commit()
+        _API_LAST_CALL_TS[provider] = time.time()
 
 # ==========================================
 # UI COMPONENTS
@@ -222,6 +233,73 @@ def _extract_component_thickness(attributes):
     return ""
 
 
+def _is_passive_component(category_text, description_text):
+    hay = f"{category_text or ''} {description_text or ''}".lower()
+    return any(
+        key in hay
+        for key in [
+            "resistor",
+            "capacitor",
+            "inductor",
+            "ferrite",
+            "bead",
+            "thermistor",
+            "ntc",
+            "ptc",
+            "varistor",
+            "passive",
+        ]
+    )
+
+
+def _decoded_passive_description(row, attributes):
+    """
+    Build a normalized passive-part summary from distributor attributes.
+    This follows common datasheet ordering fields (value/tolerance/package/rating)
+    so passive MPN descriptions are human-readable and consistently decoded.
+    """
+    if not isinstance(row, dict):
+        return ""
+    category = str(row.get("Category", "") or row.get("category", "")).strip()
+    desc = str(row.get("Description", "") or row.get("description", "")).strip()
+    if not _is_passive_component(category, desc):
+        return ""
+
+    value = _extract_attribute_value(
+        attributes,
+        "resistance",
+        "capacitance",
+        "inductance",
+        "impedance",
+        "dc resistance",
+        "dcr",
+    )
+    tolerance = _extract_attribute_value(attributes, "tolerance")
+    package = _extract_attribute_value(attributes, "package", "case", "size / dimension")
+    rated = _extract_attribute_value(
+        attributes,
+        "voltage rated",
+        "rated voltage",
+        "power",
+        "power watts",
+        "current rating",
+    )
+    temp = _extract_attribute_value(attributes, "temperature coefficient", "temp coeff", "operating temperature")
+
+    tokens = [t for t in [value, tolerance, rated, package, temp] if str(t).strip()]
+    if not tokens:
+        return ""
+
+    # Keep the original description if it already contains rich details.
+    has_detail = any(sym in desc for sym in ["±", "Ω", "ohm", "F ", "H ", "V", "W", "%"])
+    decoded = " | ".join(tokens)
+    if desc and has_detail:
+        return desc
+    if desc:
+        return f"{desc} | {decoded}"
+    return decoded
+
+
 def normalize_mpn(value):
     txt = str(value or "").strip()
     if not txt:
@@ -278,6 +356,9 @@ def add_enrichment_fields(parts, attributes, pricing):
     for row in parts:
         if not isinstance(row, dict):
             continue
+        decoded_desc = _decoded_passive_description(row, attributes)
+        if decoded_desc:
+            row["Description"] = decoded_desc
         row["MSD LEVEL"] = row.get("MSD LEVEL", "") or msd
         row["REFLOW SOLDERING TEMPERATURE"] = row.get("REFLOW SOLDERING TEMPERATURE", "") or reflow
         row["THERMAL CYCLE"] = row.get("THERMAL CYCLE", "") or thermal_cycle
@@ -3056,9 +3137,9 @@ with ui_tabs[0]:
     live_dk_scope = lc1.text_input("Digi-Key Scope (Optional)", value=os.getenv("DIGIKEY_SCOPE", ""), key="live_combo_dk_scope")
     live_mouser = lc2.text_input("Mouser API Key (Optional)", value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK), type="password", key="live_combo_mouser")
     live_split_mode = st.toggle("Fast split mode (Round-robin first hit: Digi-Key → Mouser)", value=False, key="live_combo_split_mode")
-    live_high_speed = st.toggle("🚀 High Speed Mode (Digi-Key first hit, reduced fallback merge)", value=False, key="live_combo_high_speed")
-    live_workers = st.number_input("Live combo parallel workers", min_value=1, max_value=MAX_PARALLEL_WORKERS, value=12, step=1, key="live_combo_workers")
-    st.caption("Tip: Use 4-8 workers to target ~30+ MPN/min, based on API/network response time.")
+    live_high_speed = st.toggle("🚀 High Speed Mode (Digi-Key first hit, reduced fallback merge)", value=True, key="live_combo_high_speed")
+    live_workers = st.number_input("Live combo parallel workers", min_value=1, max_value=MAX_PARALLEL_WORKERS, value=min(24, MAX_PARALLEL_WORKERS), step=1, key="live_combo_workers")
+    st.caption("Tip: Use 16-32 workers with High Speed Mode to target ~100 MPN/min (API/network dependent).")
     live_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="live_combo_fill_empty")
     if st.button("Start Live Combo Scraper", key="live_combo_run"):
         live_mpns = []
@@ -3111,7 +3192,7 @@ with ui_tabs[0]:
     bg_dk_secret = bgc1.text_input("Queue Digi-Key Client Secret", value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK), type="password", key="bg_dk_secret")
     bg_dk_scope = bgc1.text_input("Queue Digi-Key Scope", value=os.getenv("DIGIKEY_SCOPE", ""), key="bg_dk_scope")
     bg_fill_empty = bgc2.toggle("Queue fallback fill empty fields", value=True, key="bg_fill_empty")
-    bg_high_speed = bgc2.toggle("🚀 Queue High Speed Mode (Digi-Key first hit)", value=False, key="bg_high_speed")
+    bg_high_speed = bgc2.toggle("🚀 Queue High Speed Mode (Digi-Key first hit)", value=True, key="bg_high_speed")
     bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=MAX_PARALLEL_WORKERS, value=min(32, MAX_PARALLEL_WORKERS), step=1, key="bg_workers")
     if SQLITE_QUEUE_SERIAL_MODE:
         st.caption("SQLite safe mode is ON: queue writes are serialized (effective workers = 1) to avoid database lock errors.")
