@@ -86,8 +86,12 @@ MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_WORKERS", "48") or 48)
 st.set_page_config(layout="wide", page_title="COMPONENT ENGINEER DATABASE", page_icon="🛡️")
 
 
+def connect_db():
+    return sqlite3.connect(DB_PATH, timeout=30)
+
+
 def ensure_api_usage_table():
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with connect_db() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS api_usage_daily (
