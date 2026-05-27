@@ -11,7 +11,6 @@ import os
 import time
 import getpass
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -20,14 +19,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.chrome.service import Service
-
-try:
-    from webdriver_manager.chrome import ChromeDriverManager
-except ImportError:
-    ChromeDriverManager = None
-
 
 # ================= CONFIG =================
 INPUT_FILE = "mpn_list.xlsx"
@@ -56,16 +47,8 @@ REQUESTED_COLUMNS = [c.strip() for c in """Item Number,Uploaded Part Number,Uplo
 def start_driver():
     options = webdriver.ChromeOptions()
     options.add_argument("--start-maximized")
-
-    local = Path("chromedriver.exe")
-    if local.exists():
-        service = Service(str(local))
-    elif ChromeDriverManager:
-        service = Service(ChromeDriverManager().install())
-    else:
-        raise RuntimeError("chromedriver.exe not found")
-
-    return webdriver.Chrome(service=service, options=options)
+    # Selenium Manager (built into Selenium 4+) auto-resolves compatible ChromeDriver.
+    return webdriver.Chrome(options=options)
 
 
 def wait_for_spa(driver):
