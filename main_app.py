@@ -2146,8 +2146,23 @@ def run_scrubbing(mpns, user, pwd, is_headless, selected_tabs=None):
         options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
 
-    service = Service(str(BASE_DIR / "chromedriver.exe"))
-    driver = webdriver.Chrome(service=service, options=options)
+    driver = None
+    local_driver = BASE_DIR / "chromedriver.exe"
+    try:
+        if local_driver.exists():
+            # Try local driver first (for offline/restricted environments).
+            driver = webdriver.Chrome(service=Service(str(local_driver)), options=options)
+        else:
+            # Prefer Selenium Manager auto-resolution when no local driver is present.
+            driver = webdriver.Chrome(options=options)
+    except Exception as e:
+        msg = str(e)
+        if "only supports Chrome version" in msg or "session not created" in msg.lower():
+            st.warning("⚠️ Local ChromeDriver version mismatch detected. Retrying with Selenium Manager...")
+            driver = webdriver.Chrome(options=options)
+        else:
+            raise
+
     wait = WebDriverWait(driver, 15)
 
     status = st.empty()
