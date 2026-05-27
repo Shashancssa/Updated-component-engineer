@@ -7,6 +7,7 @@ Z2Data BOM Scrubber
 """
 
 import csv
+import sqlite3
 import os
 import time
 import getpass
@@ -26,6 +27,7 @@ OUTPUT_DIR = Path("output_html")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 OUTPUT_CSV = Path("z2_columns_output.csv")
+OUTPUT_DB = Path("z2_columns_output.db")
 
 Z2_DASHBOARD = "https://app.z2data.com/Parts/home"
 
@@ -41,7 +43,24 @@ MAX_CONCURRENT_TABS = 10
 SPA_TIMEOUT = 30
 TAB_WAIT = 12
 
-REQUESTED_COLUMNS = [c.strip() for c in """Item Number,Uploaded Part Number,Uploaded Manufacturer,PLM Items,STD Cost,Uploaded Description,Qty,Commodity,Location,# of Uploaded Manufacturer,Manufacturer,BOM Name,BOM Type,BOM Stage,BOM Number,BOM Family,BOM Revision Number,BOM Comments,MPN Preferred Status,Supplier Preferred Status,Z2Manufacturer Id,Part ID,Imported Row #,Z2 Part Number,Z2 Manufacturer,Family Name,Description,Product Name,Country ISO Code(2digits),Country of Origin,Item Type,Z2 Part Risk,Z2 Part Score,Datasheet Link,Split,Part Match Status,Crosses Count,Family Introduction Date,Part Introduction Year,Main Category,Sub Category 0,Category,Part Tags,Packing Type,Reel Diameter,Packing Quantity,Match Reason,Match Comment,# of PCNs,# of GIDEP,Tape Width,Note,Applications,Lifecycle Status,LC Source,Last Time Buy Date,Last Ship Date,Obsolescence Comment,Obsolescence Type,EOL Based On Product Lifecycle,Estimated Years to EOL,Manufacturer Lifecycle Forecast,Forecast date,Part Replacements,Manufacturer Lifecycle Forecast Source,Lifecycle Comment,Obsolescence Year,RoHS - Status,RoHS Version,RoHS Exemption,RoHS Source,REACH Status,CoC  Link,REACH Source,REACH - Version,China REACH Status,China RoHS Status,China REACH Source,ELV Directive Status,Lead Free Status,SCIP Number,California Proposition 65_ Source,TSCA,PFAS Source,POPS Source,POPS,PFAS,Halogen Free Status,TSCA Source,California Proposition 65,Full Material Declaration,IPC Z2 Source,EU REACH Restricted,EU REACH Restricted Source,REACH FEB 2026 (251),REACH NOV 2025 (251),Status-RoHS 2015 (863),Exemption-RoHS 2015 (863),RoHS Source Type,MSL,Maximum Reflow Temperature,Maximum Wave Temperature,# of Reflow Cycle,Base Material,Normalized Lead Finish,Lead Finish,Net Weight,Reflow Solder Time (Sec),Shelf Life [Month],Wave Solder Time,Lead Free Process Capability,Shelf Life Start,Shelf Life Condition,Net Weight_Source Type,IPN Multi-sourcing Status,# of Drop-in Crosses,# of Drop-In-A,# of Active Drop-In-A,# of Active Drop-In-B,# of Drop-In-B,# of Drop-In-C,# of Active Drop-In-C,Drop-In Same Manufacturer,China Tariff,China Tariff List,China Tariff Duty Rate,General Market Status,Current Market Status,Max Lead Time,Min Lead Time,Manufacturer NCNR,Standard Lead Time,Counterfeit Risk,Total Quantity,Lowest Cost Inventory,Lowest Cost,Quantity_ Largest Inventory,Largest Inventory,Quantity_ Second Largest Inventory,Second Largest Inventory,Average Cost,Highest Cost,Highest Cost Inventory,Number of Sellers,Min Price Break,Min Price Seller Stock,Normalized Package Name,Package Name,Pin Count,Dimensions (mm),Maximum Diameter (mm),Maximum Height (mm),Lead Shape,Mounting Type,Pin Pitch (mm),Package Dimension Note,Body Length (mm),Body Width (mm),Body Height (mm),Overall Height (mm),Conflict Mineral Status,Conflict Mineral Source,Conflict Mineral Year,Conflict Mineral Source Type,Part Grade,Temp Range,Flammability Rating,ESD Protection,MTBF/MTTF(Hrs),Reliability,MTBF/MTTF_Link,ESD Class,Flammability,ESD Source,Maximum ESD Protection Voltage(KV),Flammability Test,Automotive Qualified,Automotive Standards,Military Standards,Military Qualified,Military Source,UL Standard Details,UL File Number,Agency Approvals,Calculated Failure Rate(FIT),Agency Approvals Type,CSA Standard Details,CSA File Number,Compliance Level,Test Temperature,Activation Energy(eV),Confidence Level(UCL),Sample Size,Reliability Source Type,Reliability Source,Test Duration(Hrs),Fails Quantity,Agency Approvals Source Type,IEC Standard Details,VDE File Number,VDE Standard Details,ECCN-EU,ECCN-US,HTS-EU,UNSPSC,HTS-US,Schedule B,Minimum Operating Temperature,Maximum Supply Voltage,Minimum Supply Voltage,Temperature Coefficient,Mounting,Minimum Junction Temperature,Power Rating,Temperature Coefficient Code,Maximum Operating Temperature,Maximum Junction Temperature,Contact Finish,Pitch,Maximum Current Rating,Connector Type,Number of Positions Contacts,Thickness,Material,Lifetime @ Temp.,Tolerance,Composition,Maximum Power Dissipation,Voltage Rating,Resistance,Maximum Supply Current,Capacitance,Type,Maximum Working Voltage,Plating,Width,Features,Overall Score %,Overall Risk,Obsolescence Risk,Obsolescence Score %,Compliance Score %,Compliance Risk,Market Risk,Market Score %,Multi-Sourcing Score %,Multi-Sourcing Risk,Technology Risk,Supplier Score %,Supplier Score,Technology Factors,Technology Stage,Item Score,Item Max Forecasted Lifecycle,Item Description,# of MPN,Item Lifecycle,Item dimension,# of Suppliers,IPN Lead Finish,First Introduction Date,# of Product,Product,Sub Assembly,# of Sub Assembly,Supplier Vendor Code,Overall Supplier Score,Supplier Ownership,Parent Supplier Name,Overall Supplier Risk,DUNS Number,HQ CAGE Code,HQ Address,Year Founded,# of Employees,SIC Code,CIK,Industry,Stock Exchange,SmeltersCount,Youtube,Twitter,LinkedIn,FaceBook,Dialing code,Email,Phone,Website""".split(",")]
+RAW_REQUESTED_COLUMNS = """Item Number,Uploaded Part Number,Uploaded Manufacturer,PLM Items,STD Cost,Uploaded Description,Qty,Commodity,Location,# of Uploaded Manufacturer,Manufacturer,BOM Name,BOM Type,BOM Stage,BOM Number,BOM Family,BOM Revision Number,BOM Comments,MPN Preferred Status,Supplier Preferred Status,Z2Manufacturer Id,Part ID,Imported Row #,Z2 Part Number,Z2 Manufacturer,Family Name,Description,Product Name,Country ISO Code(2digits),Country of Origin,Item Type,Z2 Part Risk,Z2 Part Score,Datasheet Link,Split,Part Match Status,Crosses Count,Family Introduction Date,Part Introduction Year,Main Category,Sub Category 0,Category,Part Tags,Packing Type,Reel Diameter,Packing Quantity,Match Reason,Match Comment,# of PCNs,# of GIDEP,Tape Width,Note,Applications,Lifecycle Status,LC Source,Last Time Buy Date,Last Ship Date,Obsolescence Comment,Obsolescence Type,EOL Based On Product Lifecycle,Estimated Years to EOL,Manufacturer Lifecycle Forecast,Forecast date,Part Replacements,Manufacturer Lifecycle Forecast Source,Lifecycle Comment,Obsolescence Year,RoHS - Status,RoHS Version,RoHS Exemption,RoHS Source,REACH Status,CoC  Link,REACH Source,REACH - Version,China REACH Status,China RoHS Status,China REACH Source,ELV Directive Status,Lead Free Status,SCIP Number,California Proposition 65_ Source,TSCA,PFAS Source,POPS Source,POPS,PFAS,Halogen Free Status,TSCA Source,California Proposition 65,Full Material Declaration,IPC Z2 Source,EU REACH Restricted,EU REACH Restricted Source,REACH FEB 2026 (251),REACH NOV 2025 (251),Status-RoHS 2015 (863),Exemption-RoHS 2015 (863),RoHS Source Type,MSL,Maximum Reflow Temperature,Maximum Wave Temperature,# of Reflow Cycle,Base Material,Normalized Lead Finish,Lead Finish,Net Weight,Reflow Solder Time (Sec),Shelf Life [Month],Wave Solder Time,Lead Free Process Capability,Shelf Life Start,Shelf Life Condition,Net Weight_Source Type,IPN Multi-sourcing Status,# of Drop-in Crosses,# of Drop-In-A,# of Active Drop-In-A,# of Active Drop-In-B,# of Drop-In-B,# of Drop-In-C,# of Active Drop-In-C,Drop-In Same Manufacturer,China Tariff,China Tariff List,China Tariff Duty Rate,General Market Status,Current Market Status,Max Lead Time,Min Lead Time,Manufacturer NCNR,Standard Lead Time,Counterfeit Risk,Total Quantity,Lowest Cost Inventory,Lowest Cost,Quantity_ Largest Inventory,Largest Inventory,Quantity_ Second Largest Inventory,Second Largest Inventory,Average Cost,Highest Cost,Highest Cost Inventory,Number of Sellers,Min Price Break,Min Price Seller Stock,Normalized Package Name,Package Name,Pin Count,Dimensions (mm),Maximum Diameter (mm),Maximum Height (mm),Lead Shape,Mounting Type,Pin Pitch (mm),Package Dimension Note,Body Length (mm),Body Width (mm),Body Height (mm),Overall Height (mm),Conflict Mineral Status,Conflict Mineral Source,Conflict Mineral Year,Conflict Mineral Source Type,Part Grade,Temp Range,Flammability Rating,ESD Protection,MTBF/MTTF(Hrs),Reliability,MTBF/MTTF_Link,ESD Class,Flammability,ESD Source,Maximum ESD Protection Voltage(KV),Flammability Test,Automotive Qualified,Automotive Standards,Military Standards,Military Qualified,Military Source,UL Standard Details,UL File Number,Agency Approvals,Calculated Failure Rate(FIT),Agency Approvals Type,CSA Standard Details,CSA File Number,Compliance Level,Test Temperature,Activation Energy(eV),Confidence Level(UCL),Sample Size,Reliability Source Type,Reliability Source,Test Duration(Hrs),Fails Quantity,Agency Approvals Source Type,IEC Standard Details,VDE File Number,VDE Standard Details,ECCN-EU,ECCN-US,HTS-EU,UNSPSC,HTS-US,Schedule B,Minimum Operating Temperature,Maximum Supply Voltage,Minimum Supply Voltage,Temperature Coefficient,Mounting,Minimum Junction Temperature,Power Rating,Temperature Coefficient Code,Maximum Operating Temperature,Maximum Junction Temperature,Contact Finish,Pitch,Maximum Current Rating,Connector Type,Number of Positions Contacts,Thickness,Material,Lifetime @ Temp.,Tolerance,Composition,Maximum Power Dissipation,Voltage Rating,Resistance,Maximum Supply Current,Capacitance,Type,Maximum Working Voltage,Plating,Width,Features,Overall Score %,Overall Risk,Obsolescence Risk,Obsolescence Score %,Compliance Score %,Compliance Risk,Market Risk,Market Score %,Multi-Sourcing Score %,Multi-Sourcing Risk,Technology Risk,Supplier Score %,Supplier Score,Technology Factors,Technology Stage,Item Score,Item Max Forecasted Lifecycle,Item Description,# of MPN,Item Lifecycle,Item dimension,# of Suppliers,IPN Lead Finish,First Introduction Date,# of Product,Product,Sub Assembly,# of Sub Assembly,Supplier Vendor Code,Overall Supplier Score,Supplier Ownership,Parent Supplier Name,Overall Supplier Risk,DUNS Number,HQ CAGE Code,HQ Address,Year Founded,# of Employees,SIC Code,CIK,Industry,Stock Exchange,SmeltersCount,Youtube,Twitter,LinkedIn,FaceBook,Dialing code,Email,Phone,Website"""
+
+
+def unique_columns(raw_text):
+    cols = [c.strip() for c in raw_text.split(",") if c.strip()]
+    seen = set()
+    out = []
+    for c in cols:
+        k = c.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(c)
+    return out
+
+
+REQUESTED_COLUMNS = unique_columns(RAW_REQUESTED_COLUMNS)
+
 
 
 def start_driver():
@@ -176,6 +195,43 @@ def process_single_tab(driver, handle, mpn):
     return row
 
 
+
+
+def sqlite_col_name(col):
+    safe = "".join(ch if ch.isalnum() else "_" for ch in col).strip("_")
+    if not safe:
+        safe = "col"
+    return safe.lower()
+
+
+def write_results_to_db(rows):
+    if not rows:
+        return
+
+    col_map = {c: sqlite_col_name(c) for c in REQUESTED_COLUMNS}
+    used = {}
+    for k, v in list(col_map.items()):
+        cnt = used.get(v, 0)
+        if cnt:
+            col_map[k] = f"{v}_{cnt}"
+        used[v] = cnt + 1
+
+    conn = sqlite3.connect(str(OUTPUT_DB))
+    cur = conn.cursor()
+    cur.execute("DROP TABLE IF EXISTS z2_columns")
+    col_defs = ['"mpn" TEXT'] + [f'"{col_map[c]}" TEXT' for c in REQUESTED_COLUMNS]
+    cur.execute(f"CREATE TABLE z2_columns ({', '.join(col_defs)})")
+
+    insert_cols = ["mpn"] + [col_map[c] for c in REQUESTED_COLUMNS]
+    placeholders = ",".join(["?"] * len(insert_cols))
+    sql = f'INSERT INTO z2_columns ({", ".join([f"\"{c}\"" for c in insert_cols])}) VALUES ({placeholders})'
+    for row in rows:
+        vals = [row.get("MPN", "")] + [row.get(c, "") for c in REQUESTED_COLUMNS]
+        cur.execute(sql, vals)
+
+    conn.commit()
+    conn.close()
+
 def main():
     print("🚀 Z2Data BOM Scrubber – MULTI-TAB VERSION")
     if not os.path.exists(INPUT_FILE):
@@ -207,11 +263,16 @@ def main():
     driver.get(Z2_DASHBOARD)
     wait_for_spa(driver)
 
-    while len(driver.window_handles) < min(MAX_CONCURRENT_TABS, len(parts)):
+    target_tabs = min(MAX_CONCURRENT_TABS, len(parts))
+    while len(driver.window_handles) < target_tabs:
         driver.switch_to.new_window('tab')
-        driver.get('about:blank')
 
-    handles = driver.window_handles[:min(MAX_CONCURRENT_TABS, len(parts))]
+    handles = driver.window_handles[:target_tabs]
+    for i, handle in enumerate(handles, 1):
+        driver.switch_to.window(handle)
+        driver.get(Z2_DASHBOARD)
+        wait_for_spa(driver)
+        print(f"🧩 Tab {i}/{target_tabs} ready")
     results = []
     for idx, mpn in enumerate(parts, 1):
         handle = handles[(idx - 1) % len(handles)]
@@ -230,6 +291,8 @@ def main():
             w.writeheader()
             w.writerows(results)
         print(f"📄 Column output saved: {OUTPUT_CSV}")
+        write_results_to_db(results)
+        print(f"🗄️ Column output DB saved: {OUTPUT_DB}")
 
     driver.quit()
     print("🎉 Completed")
