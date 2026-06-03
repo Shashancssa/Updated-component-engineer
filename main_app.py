@@ -53,6 +53,10 @@ NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "ECZ622yjXXrCVDp
 GROQ_API_KEY_FALLBACK = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_FALLBACK = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
+# Backward-compatible aliases for older UI/session code that still references Gemini names.
+# Groq is the active AI decode provider; keep these defined so stale Streamlit widgets do not crash startup.
+GEMINI_API_KEY_FALLBACK = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL_FALLBACK = os.getenv("GEMINI_MODEL", "")
 _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
 _API_LAST_CALL_TS = {}
