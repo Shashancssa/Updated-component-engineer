@@ -1354,6 +1354,115 @@ def get_datasheet_url_for_mpn(mpn):
     return ""
 
 
+def _extract_datasheet_url_from_payload(payload):
+    if not isinstance(payload, dict):
+        return ""
+    for part in payload.get("parts", []) or []:
+        if not isinstance(part, dict):
+            continue
+        for key in ["Data Sheet URL", "DatasheetUrl", "DataSheetUrl", "Datasheet", "DATASHEETLINK"]:
+            val = str(part.get(key, "") or "").strip()
+            if val:
+                return val
+    for doc in payload.get("documents", []) or []:
+        if not isinstance(doc, dict):
+            continue
+        doc_type = str(doc.get("Type", "") or "").lower()
+        url = str(doc.get("URL", "") or doc.get("Data Sheet URL", "") or "").strip()
+        if url and ("data" in doc_type or "datasheet" in doc_type or "sheet" in doc_type):
+            return url
+    return ""
+
+
+def resolve_datasheet_url_live(
+    mpn,
+    source_order=None,
+    mouser_key="",
+    digikey_id="",
+    digikey_secret="",
+    digikey_scope="",
+    digikey_sandbox=False,
+):
+    """Resolve datasheet from DB first, then live Digi-Key/Mouser APIs."""
+    mpn = str(mpn or "").strip()
+    if not mpn:
+        return "", "No MPN"
+
+    db_url = get_datasheet_url_for_mpn(mpn)
+    if db_url:
+        return db_url, "DB unified_part_cache"
+
+    source_order = ["digikey", "mouser"] if source_order is None else source_order
+    errors = []
+    for provider in source_order:
+        provider_key = str(provider or "").strip().lower()
+        try:
+            payload = {}
+            if provider_key == "digikey":
+                if not str(digikey_id or "").strip() or not str(digikey_secret or "").strip():
+                    errors.append("Digi-Key credentials missing")
+                    continue
+                payload = fetch_digikey_part_data(
+                    mpn,
+                    client_id=str(digikey_id).strip(),
+                    client_secret=str(digikey_secret).strip(),
+                    scope=str(digikey_scope or "").strip() or None,
+                    use_sandbox=bool(digikey_sandbox),
+                    site="US",
+                    currency="USD",
+                )
+            elif provider_key == "mouser":
+                if not str(mouser_key or "").strip():
+                    errors.append("Mouser API key missing")
+                    continue
+                payload = fetch_mouser_part_data(mpn, str(mouser_key).strip())
+            else:
+                continue
+
+            url = _extract_datasheet_url_from_payload(payload)
+            if url:
+                return url, provider_key.title()
+            errors.append(f"{provider_key.title()} returned no datasheet link")
+        except Exception as ex:
+            errors.append(f"{provider_key.title()}: {ex}")
+    return "", "; ".join(errors) if errors else "No datasheet URL found"
+
+
+def resolve_datasheet_urls_for_analyzer(
+    mpns,
+    manual_urls=None,
+    source_order=None,
+    mouser_key="",
+    digikey_id="",
+    digikey_secret="",
+    digikey_scope="",
+    digikey_sandbox=False,
+):
+    rows = []
+    pairs = []
+    manual_urls = manual_urls or {}
+    for mpn in mpns:
+        clean = str(mpn or "").strip()
+        if not clean:
+            continue
+        manual = str(manual_urls.get(clean, "") or "").strip()
+        if manual:
+            url, source = manual, "Manual URL"
+        else:
+            url, source = resolve_datasheet_url_live(
+                clean,
+                source_order=source_order,
+                mouser_key=mouser_key,
+                digikey_id=digikey_id,
+                digikey_secret=digikey_secret,
+                digikey_scope=digikey_scope,
+                digikey_sandbox=digikey_sandbox,
+            )
+        pairs.append((clean, url))
+        rows.append({"MPN": clean, "Datasheet URL": url, "Resolved From": source})
+    return pairs, rows
+
+
 def download_datasheet_for_gemini(url):
     url = str(url or "").strip()
     if not url:
@@ -4115,7 +4224,7 @@ with ui_tabs[5]:
 
 with ui_tabs[6]:
     st.subheader("🤖 Datasheet Analyzer (Gemini AI)")
-    st.caption("Add multiple MPNs, resolve their datasheet links from the DB (or enter URLs manually), then compare parameters using Gemini AI.")
+    st.caption("Add multiple MPNs, resolve datasheet links from DB first, then Digi-Key/Mouser live APIs (or enter URLs manually), then compare parameters using Gemini AI.")
 
     if "datasheet_analyzer_mpns" not in st.session_state:
         st.session_state["datasheet_analyzer_mpns"] = []
@@ -4152,6 +4261,43 @@ with ui_tabs[6]:
                 help="Auto-filled from unified_part_cache when available; edit/paste if blank or incorrect.",
             ).strip()
 
+    st.markdown("#### Datasheet Link Sources")
+    source_choice = st.radio(
+        "Auto-find datasheet links from",
+        ["Digi-Key then Mouser", "Mouser then Digi-Key", "DB/manual only"],
+        horizontal=True,
+        key="datasheet_analyzer_source_choice",
+    )
+    source_order = {
+        "Digi-Key then Mouser": ["digikey", "mouser"],
+        "Mouser then Digi-Key": ["mouser", "digikey"],
+        "DB/manual only": [],
+    }.get(source_choice, ["digikey", "mouser"])
+    src1, src2 = st.columns(2)
+    analyzer_mouser_key = src1.text_input(
+        "Mouser API Key (for datasheet link lookup)",
+        value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK),
+        type="password",
+        key="datasheet_analyzer_mouser_key",
+    )
+    analyzer_dk_id = src2.text_input(
+        "Digi-Key Client ID (for datasheet link lookup)",
+        value=os.getenv("DIGIKEY_CLIENT_ID", DIGIKEY_CLIENT_ID_FALLBACK),
+        key="datasheet_analyzer_dk_id",
+    )
+    analyzer_dk_secret = src2.text_input(
+        "Digi-Key Client Secret (for datasheet link lookup)",
+        value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK),
+        type="password",
+        key="datasheet_analyzer_dk_secret",
+    )
+    analyzer_dk_scope = src2.text_input(
+        "Digi-Key Scope (optional)",
+        value=os.getenv("DIGIKEY_SCOPE", ""),
+        key="datasheet_analyzer_dk_scope",
+    )
+    analyzer_dk_sandbox = src2.toggle("Use Digi-Key Sandbox", value=False, key="datasheet_analyzer_dk_sandbox")
+
     model = st.text_input("Gemini Model", value=GEMINI_MODEL_DEFAULT, key="datasheet_analyzer_model")
     api_key = st.text_input(
         "Gemini AI API Key",
@@ -4163,8 +4309,20 @@ with ui_tabs[6]:
     analysis_name = st.text_input("Analysis Name", value="Datasheet comparison", key="datasheet_analyzer_name")
 
     if st.button("🔍 Compare Datasheets with Gemini", key="datasheet_analyzer_compare_btn"):
-        pairs = [(mpn, url_overrides.get(mpn, "")) for mpn in analyzer_mpns]
         try:
+            with st.spinner("Finding datasheet links from DB / Digi-Key / Mouser..."):
+                pairs, resolve_status = resolve_datasheet_urls_for_analyzer(
+                    analyzer_mpns,
+                    manual_urls=url_overrides,
+                    source_order=source_order,
+                    mouser_key=analyzer_mouser_key,
+                    digikey_id=analyzer_dk_id,
+                    digikey_secret=analyzer_dk_secret,
+                    digikey_scope=analyzer_dk_scope,
+                    digikey_sandbox=analyzer_dk_sandbox,
+                )
+            st.markdown("#### Datasheet link resolution")
+            st.dataframe(pd.DataFrame(resolve_status), width="stretch", hide_index=True)
             with st.spinner("Gemini is reading datasheets and extracting parameters..."):
                 result_text, raw_json, attach_status = call_gemini_datasheet_analysis(api_key, model, pairs)
                 save_datasheet_analysis(analysis_name, pairs, model, result_text, raw_json)
