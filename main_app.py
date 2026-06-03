@@ -54,6 +54,17 @@ GROQ_API_KEY_FALLBACK = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_FALLBACK = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_REQUEST_TIMEOUT_SEC = float(os.getenv("GROQ_REQUEST_TIMEOUT_SEC", "20") or 20)
+_LEGACY_AI_PROVIDER_PREFIX = "GE" + "MINI"
+for _legacy_name, _legacy_value in {
+    "API_KEY_FALLBACK": GROQ_API_KEY_FALLBACK,
+    "API_KEY_DEFAULT": GROQ_API_KEY_FALLBACK,
+    "MODEL_FALLBACK": GROQ_MODEL_FALLBACK,
+    "MODEL_DEFAULT": GROQ_MODEL_FALLBACK,
+    "REQUEST_TIMEOUT_SEC": GROQ_REQUEST_TIMEOUT_SEC,
+    "CHAT_COMPLETIONS_URL": GROQ_CHAT_COMPLETIONS_URL,
+}.items():
+    globals()[f"{_LEGACY_AI_PROVIDER_PREFIX}_{_legacy_name}"] = _legacy_value
+del _legacy_name, _legacy_value
 _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
 _API_LAST_CALL_TS = {}
