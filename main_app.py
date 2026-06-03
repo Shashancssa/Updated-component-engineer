@@ -1463,6 +1463,102 @@ def resolve_datasheet_urls_for_analyzer(
     return pairs, rows
 
 
+def _payload_to_parametric_rows(mpn, source_name, payload):
+    rows = []
+    if not isinstance(payload, dict):
+        return rows
+
+    for part in payload.get("parts", [])[:1] or []:
+        if not isinstance(part, dict):
+            continue
+        for key in [
+            "Manufacturer",
+            "Manufacturer Part Number",
+            "Supplier Part Number",
+            "Description",
+            "Category",
+            "Lifecycle Status",
+            "ROHS",
+            "Stock",
+            "Lead Time",
+            "Data Sheet URL",
+            "Product URL",
+        ]:
+            val = str(part.get(key, "") or "").strip()
+            if val:
+                rows.append({"MPN": mpn, "Source": source_name, "Parameter": key, "Value": val})
+
+    for attr in payload.get("attributes", []) or []:
+        if not isinstance(attr, dict):
+            continue
+        param = str(attr.get("Attribute", "") or attr.get("Parameter", "") or "").strip()
+        val = str(attr.get("Value", "") or "").strip()
+        if param and val:
+            rows.append({"MPN": mpn, "Source": source_name, "Parameter": param, "Value": val})
+    return rows
+
+
+def build_distributor_parametric_context(
+    mpns,
+    source_order=None,
+    mouser_key="",
+    digikey_id="",
+    digikey_secret="",
+    digikey_scope="",
+    digikey_sandbox=False,
+):
+    """Fetch Mouser/Digi-Key parametric data so Gemini can use it when datasheet values are missing."""
+    source_order = ["digikey", "mouser"] if source_order is None else source_order
+    rows = []
+    status_rows = []
+    for mpn in [str(x or "").strip() for x in mpns if str(x or "").strip()]:
+        for provider in source_order:
+            provider_key = str(provider or "").strip().lower()
+            source_name = "Digi-Key" if provider_key == "digikey" else "Mouser" if provider_key == "mouser" else provider_key
+            try:
+                payload = {}
+                if provider_key == "digikey":
+                    if not str(digikey_id or "").strip() or not str(digikey_secret or "").strip():
+                        status_rows.append({"MPN": mpn, "Source": source_name, "Status": "Skipped: credentials missing"})
+                        continue
+                    payload = fetch_digikey_part_data(
+                        mpn,
+                        client_id=str(digikey_id).strip(),
+                        client_secret=str(digikey_secret).strip(),
+                        scope=str(digikey_scope or "").strip() or None,
+                        use_sandbox=bool(digikey_sandbox),
+                        site="US",
+                        currency="USD",
+                    )
+                elif provider_key == "mouser":
+                    if not str(mouser_key or "").strip():
+                        status_rows.append({"MPN": mpn, "Source": source_name, "Status": "Skipped: API key missing"})
+                        continue
+                    payload = fetch_mouser_part_data(mpn, str(mouser_key).strip())
+                else:
+                    continue
+
+                provider_rows = _payload_to_parametric_rows(mpn, source_name, payload)
+                rows.extend(provider_rows)
+                status_rows.append({
+                    "MPN": mpn,
+                    "Source": source_name,
+                    "Status": f"Loaded {len(provider_rows)} parametric/detail rows" if provider_rows else "No parametric rows returned",
+                })
+            except Exception as ex:
+                status_rows.append({"MPN": mpn, "Source": source_name, "Status": f"Error: {ex}"})
+
+    lines = [
+        "Distributor parametric fallback data below. Use this only when the datasheet attachment/link does not contain a value.",
+        "Each row has MPN | Source | Parameter | Value.",
+    ]
+    for row in rows[:500]:
+        lines.append(f"{row['MPN']} | {row['Source']} | {row['Parameter']} | {row['Value']}")
+    if len(rows) > 500:
+        lines.append(f"... truncated {len(rows) - 500} additional distributor parametric rows ...")
+    return "\n".join(lines), rows, status_rows
+
+
 def download_datasheet_for_gemini(url):
     url = str(url or "").strip()
     if not url:
@@ -1483,14 +1579,22 @@ def download_datasheet_for_gemini(url):
         return None, "", str(ex)
 
 
-def build_datasheet_parts_for_gemini(mpn_url_pairs):
+def build_datasheet_parts_for_gemini(mpn_url_pairs, parametric_context=""):
+    mpn_headers = " | ".join([str(mpn) for mpn, _ in mpn_url_pairs])
     prompt_lines = [
         "You are an expert electronics component datasheet analyzer.",
-        "Compare the supplied MPN datasheets and extract all important electrical, mechanical, compliance, lifecycle, soldering, package, reliability, and ordering parameters.",
-        "Return two sections: (1) a concise comparison table with MPNs as rows and parameters as columns, and (2) a JSON object named extracted_parameters mapping each MPN to parameter/value/source_note entries.",
-        "If a value is not present, write Not found. Highlight key differences and risks.",
+        "Use datasheet content as the primary source. If a parameter is not visible in the datasheet, use the supplied Mouser/Digi-Key parametric fallback data and mark that source clearly.",
+        "Return table-wise comparison data. Do not begin with prose or an apology.",
+        "First output a markdown table under heading: ## Datasheet + Distributor Parameter Comparison.",
+        f"The table columns must be: Parameter Category | Parameter | {mpn_headers} | Source Used | Difference / Risk.",
+        "Include rows for resistance/value, tolerance, power rating, rated current, voltage, temperature coefficient, package/case, dimensions, operating temperature, technology/composition, mounting, lifecycle/status, RoHS, REACH, halogen/lead-free, MSL, solder/reflow, packaging/reel quantity, datasheet link, manufacturer, and any other important datasheet parameters found.",
+        "In each MPN cell include the value and source in parentheses, for example: 1.8 kΩ (Datasheet), 1% (Mouser Parametric), or Not found.",
+        "After the comparison table, output a second markdown table under heading: ## Missing / Fallback Source Audit with columns: MPN | Parameter | Datasheet Status | Fallback Source | Final Value.",
+        "Finally output a compact JSON object named extracted_parameters. Keep all output grounded only in datasheets and supplied distributor parametric data.",
     ]
     parts = [{"text": "\n".join(prompt_lines)}]
+    if str(parametric_context or "").strip():
+        parts.append({"text": str(parametric_context).strip()})
     status_rows = []
     for mpn, url in mpn_url_pairs:
         content, mime_type, error = download_datasheet_for_gemini(url)
@@ -1504,7 +1608,7 @@ def build_datasheet_parts_for_gemini(mpn_url_pairs):
     return parts, status_rows
 
 
-def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs):
+def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_context=""):
     api_key = str(api_key or "").strip()
     model = str(model or GEMINI_MODEL_DEFAULT).strip() or GEMINI_MODEL_DEFAULT
     if not api_key:
@@ -1512,7 +1616,7 @@ def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs):
     if not mpn_url_pairs:
         raise ValueError("Add at least one MPN before running datasheet comparison.")
 
-    parts, status_rows = build_datasheet_parts_for_gemini(mpn_url_pairs)
+    parts, status_rows = build_datasheet_parts_for_gemini(mpn_url_pairs, parametric_context=parametric_context)
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{parse.quote(model, safe='')}:generateContent"
     payload = {
         "contents": [{"role": "user", "parts": parts}],
@@ -4323,8 +4427,23 @@ with ui_tabs[6]:
                 )
             st.markdown("#### Datasheet link resolution")
             st.dataframe(pd.DataFrame(resolve_status), width="stretch", hide_index=True)
-            with st.spinner("Gemini is reading datasheets and extracting parameters..."):
-                result_text, raw_json, attach_status = call_gemini_datasheet_analysis(api_key, model, pairs)
+            with st.spinner("Loading Mouser/Digi-Key parametric fallback data..."):
+                parametric_context, parametric_rows, parametric_status = build_distributor_parametric_context(
+                    analyzer_mpns,
+                    source_order=source_order,
+                    mouser_key=analyzer_mouser_key,
+                    digikey_id=analyzer_dk_id,
+                    digikey_secret=analyzer_dk_secret,
+                    digikey_scope=analyzer_dk_scope,
+                    digikey_sandbox=analyzer_dk_sandbox,
+                )
+            st.markdown("#### Distributor parametric fallback status")
+            st.dataframe(pd.DataFrame(parametric_status), width="stretch", hide_index=True)
+            if parametric_rows:
+                with st.expander("View Mouser/Digi-Key parametric fallback rows", expanded=False):
+                    st.dataframe(pd.DataFrame(parametric_rows), width="stretch", hide_index=True)
+            with st.spinner("Gemini is reading datasheets and extracting table-wise parameters..."):
+                result_text, raw_json, attach_status = call_gemini_datasheet_analysis(api_key, model, pairs, parametric_context=parametric_context)
                 save_datasheet_analysis(analysis_name, pairs, model, result_text, raw_json)
             st.success("Datasheet analysis complete and saved to DB table: datasheet_analysis_cache")
             st.markdown("#### Datasheet attachment status")
