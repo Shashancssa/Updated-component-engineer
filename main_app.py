@@ -101,7 +101,7 @@ def connect_db(timeout=30):
 
 
 def ensure_api_usage_table():
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with connect_db() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS api_usage_daily (
@@ -176,6 +176,12 @@ def show_sidebar_logo():
         st.sidebar.image(str(LOGO_PATH), width="stretch")
     st.sidebar.title("⚙️ Global Settings")
     mode = st.sidebar.toggle("Headless Mode (Background)", value=True)
+    st.session_state["gemini_api_key"] = st.sidebar.text_input(
+        "Gemini AI API Key",
+        value=st.session_state.get("gemini_api_key", GEMINI_API_KEY_FALLBACK),
+        type="password",
+        help="Used by Datasheet Analyzer only for this running dashboard session.",
+    )
     return mode
 
 def show_footer():
@@ -1384,6 +1390,614 @@ def ensure_unified_parts_table():
         conn.commit()
 
 
+
+def ensure_datasheet_analysis_table():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS datasheet_analysis_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_name TEXT,
+                mpns TEXT NOT NULL,
+                datasheet_urls TEXT,
+                gemini_model TEXT,
+                result_markdown TEXT,
+                result_json TEXT,
+                created_at_utc TEXT NOT NULL
+            );
+            """
+        )
+        conn.commit()
+
+
+def get_datasheet_url_for_mpn(mpn):
+    mpn = str(mpn or "").strip()
+    if not mpn or not DB_PATH.exists():
+        return ""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT datasheet_url FROM unified_part_cache WHERE UPPER(TRIM(mpn))=UPPER(TRIM(?))",
+                (mpn,),
+            ).fetchone()
+            if row and str(row[0] or "").strip():
+                return str(row[0]).strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _extract_datasheet_url_from_payload(payload):
+    if not isinstance(payload, dict):
+        return ""
+    for part in payload.get("parts", []) or []:
+        if not isinstance(part, dict):
+            continue
+        for key in ["Data Sheet URL", "DatasheetUrl", "DataSheetUrl", "Datasheet", "DATASHEETLINK"]:
+            val = str(part.get(key, "") or "").strip()
+            if val:
+                return val
+    for doc in payload.get("documents", []) or []:
+        if not isinstance(doc, dict):
+            continue
+        doc_type = str(doc.get("Type", "") or "").lower()
+        url = str(doc.get("URL", "") or doc.get("Data Sheet URL", "") or "").strip()
+        if url and ("data" in doc_type or "datasheet" in doc_type or "sheet" in doc_type):
+            return url
+    return ""
+
+
+def resolve_datasheet_url_live(
+    mpn,
+    source_order=None,
+    mouser_key="",
+    digikey_id="",
+    digikey_secret="",
+    digikey_scope="",
+    digikey_sandbox=False,
+):
+    """Resolve datasheet from DB first, then live Digi-Key/Mouser APIs."""
+    mpn = str(mpn or "").strip()
+    if not mpn:
+        return "", "No MPN"
+
+    db_url = get_datasheet_url_for_mpn(mpn)
+    if db_url:
+        return db_url, "DB unified_part_cache"
+
+    source_order = ["digikey", "mouser"] if source_order is None else source_order
+    errors = []
+    for provider in source_order:
+        provider_key = str(provider or "").strip().lower()
+        try:
+            payload = {}
+            if provider_key == "digikey":
+                if not str(digikey_id or "").strip() or not str(digikey_secret or "").strip():
+                    errors.append("Digi-Key credentials missing")
+                    continue
+                payload = fetch_digikey_part_data(
+                    mpn,
+                    client_id=str(digikey_id).strip(),
+                    client_secret=str(digikey_secret).strip(),
+                    scope=str(digikey_scope or "").strip() or None,
+                    use_sandbox=bool(digikey_sandbox),
+                    site="US",
+                    currency="USD",
+                )
+            elif provider_key == "mouser":
+                if not str(mouser_key or "").strip():
+                    errors.append("Mouser API key missing")
+                    continue
+                payload = fetch_mouser_part_data(mpn, str(mouser_key).strip())
+            else:
+                continue
+
+            url = _extract_datasheet_url_from_payload(payload)
+            if url:
+                return url, provider_key.title()
+            errors.append(f"{provider_key.title()} returned no datasheet link")
+        except Exception as ex:
+            errors.append(f"{provider_key.title()}: {ex}")
+    return "", "; ".join(errors) if errors else "No datasheet URL found"
+
+
+def resolve_datasheet_urls_for_analyzer(
+    mpns,
+    manual_urls=None,
+    source_order=None,
+    mouser_key="",
+    digikey_id="",
+    digikey_secret="",
+    digikey_scope="",
+    digikey_sandbox=False,
+):
+    rows = []
+    pairs = []
+    manual_urls = manual_urls or {}
+    for mpn in mpns:
+        clean = str(mpn or "").strip()
+        if not clean:
+            continue
+        manual = str(manual_urls.get(clean, "") or "").strip()
+        if manual:
+            url, source = manual, "Manual URL"
+        else:
+            url, source = resolve_datasheet_url_live(
+                clean,
+                source_order=source_order,
+                mouser_key=mouser_key,
+                digikey_id=digikey_id,
+                digikey_secret=digikey_secret,
+                digikey_scope=digikey_scope,
+                digikey_sandbox=digikey_sandbox,
+            )
+        pairs.append((clean, url))
+        rows.append({"MPN": clean, "Datasheet URL": url, "Resolved From": source})
+    return pairs, rows
+
+
+def _payload_to_parametric_rows(mpn, source_name, payload):
+    rows = []
+    if not isinstance(payload, dict):
+        return rows
+
+    for part in payload.get("parts", [])[:1] or []:
+        if not isinstance(part, dict):
+            continue
+        for key in [
+            "Manufacturer",
+            "Manufacturer Part Number",
+            "Supplier Part Number",
+            "Description",
+            "Category",
+            "Lifecycle Status",
+            "ROHS",
+            "Stock",
+            "Lead Time",
+            "Data Sheet URL",
+            "Product URL",
+        ]:
+            val = str(part.get(key, "") or "").strip()
+            if val:
+                rows.append({"MPN": mpn, "Source": source_name, "Parameter": key, "Value": val})
+
+    for attr in payload.get("attributes", []) or []:
+        if not isinstance(attr, dict):
+            continue
+        param = str(attr.get("Attribute", "") or attr.get("Parameter", "") or "").strip()
+        val = str(attr.get("Value", "") or "").strip()
+        if param and val:
+            rows.append({"MPN": mpn, "Source": source_name, "Parameter": param, "Value": val})
+    return rows
+
+
+def build_distributor_parametric_context(
+    mpns,
+    source_order=None,
+    mouser_key="",
+    digikey_id="",
+    digikey_secret="",
+    digikey_scope="",
+    digikey_sandbox=False,
+):
+    """Fetch Mouser/Digi-Key parametric data so Gemini can use it when datasheet values are missing."""
+    source_order = ["digikey", "mouser"] if source_order is None else source_order
+    rows = []
+    status_rows = []
+    for mpn in [str(x or "").strip() for x in mpns if str(x or "").strip()]:
+        for provider in source_order:
+            provider_key = str(provider or "").strip().lower()
+            source_name = "Digi-Key" if provider_key == "digikey" else "Mouser" if provider_key == "mouser" else provider_key
+            try:
+                payload = {}
+                if provider_key == "digikey":
+                    if not str(digikey_id or "").strip() or not str(digikey_secret or "").strip():
+                        status_rows.append({"MPN": mpn, "Source": source_name, "Status": "Skipped: credentials missing"})
+                        continue
+                    payload = fetch_digikey_part_data(
+                        mpn,
+                        client_id=str(digikey_id).strip(),
+                        client_secret=str(digikey_secret).strip(),
+                        scope=str(digikey_scope or "").strip() or None,
+                        use_sandbox=bool(digikey_sandbox),
+                        site="US",
+                        currency="USD",
+                    )
+                elif provider_key == "mouser":
+                    if not str(mouser_key or "").strip():
+                        status_rows.append({"MPN": mpn, "Source": source_name, "Status": "Skipped: API key missing"})
+                        continue
+                    payload = fetch_mouser_part_data(mpn, str(mouser_key).strip())
+                else:
+                    continue
+
+                provider_rows = _payload_to_parametric_rows(mpn, source_name, payload)
+                rows.extend(provider_rows)
+                status_rows.append({
+                    "MPN": mpn,
+                    "Source": source_name,
+                    "Status": f"Loaded {len(provider_rows)} parametric/detail rows" if provider_rows else "No parametric rows returned",
+                })
+            except Exception as ex:
+                status_rows.append({"MPN": mpn, "Source": source_name, "Status": f"Error: {ex}"})
+
+    lines = [
+        "Distributor parametric fallback data below. Use this only when the datasheet attachment/link does not contain a value.",
+        "Each row has MPN | Source | Parameter | Value.",
+    ]
+    for row in rows[:500]:
+        lines.append(f"{row['MPN']} | {row['Source']} | {row['Parameter']} | {row['Value']}")
+    if len(rows) > 500:
+        lines.append(f"... truncated {len(rows) - 500} additional distributor parametric rows ...")
+    return "\n".join(lines), rows, status_rows
+
+
+def _pdf_escape(text):
+    return str(text or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _strip_json_from_report(markdown_text):
+    text = str(markdown_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    markers = ["```json", "extracted_parameters", "{\n", "\n{"]
+    cut_positions = [text.find(m) for m in markers if text.find(m) >= 0]
+    if cut_positions:
+        text = text[:min(cut_positions)].rstrip()
+    return text
+
+
+def _clean_pdf_text(text):
+    return (
+        str(text or "")
+        .replace("**", "")
+        .replace("__", "")
+        .replace("`", "")
+        .replace("<br>", " ")
+        .replace("<br/>", " ")
+        .strip()
+    )
+
+
+def _split_markdown_table_row(row):
+    row = str(row or "").strip()
+    if row.startswith("|"):
+        row = row[1:]
+    if row.endswith("|"):
+        row = row[:-1]
+    return [_clean_pdf_text(c) for c in row.split("|")]
+
+
+def _is_markdown_separator(row):
+    cells = _split_markdown_table_row(row)
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", c.replace(" ", "")) for c in cells if c)
+
+
+def _parse_report_blocks(markdown_text):
+    text = _strip_json_from_report(markdown_text)
+    lines = text.split("\n")
+    blocks = []
+    i = 0
+    while i < len(lines):
+        raw = lines[i].strip()
+        if not raw:
+            i += 1
+            continue
+        if raw.startswith("|") and i + 1 < len(lines) and _is_markdown_separator(lines[i + 1]):
+            rows = [_split_markdown_table_row(raw)]
+            i += 2
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                if not _is_markdown_separator(lines[i]):
+                    rows.append(_split_markdown_table_row(lines[i]))
+                i += 1
+            blocks.append(("table", rows))
+            continue
+        if raw.startswith("#"):
+            blocks.append(("heading", _clean_pdf_text(raw.lstrip("#"))))
+        else:
+            blocks.append(("text", _clean_pdf_text(raw)))
+        i += 1
+    return blocks
+
+
+def _wrap_pdf_cell(text, width, font_size):
+    text = _clean_pdf_text(text)
+    max_chars = max(8, int(width / (font_size * 0.48)))
+    words = text.split()
+    if not words:
+        return [""]
+    lines = []
+    current = ""
+    for word in words:
+        if len(word) > max_chars:
+            if current:
+                lines.append(current)
+                current = ""
+            while len(word) > max_chars:
+                lines.append(word[:max_chars])
+                word = word[max_chars:]
+        trial = f"{current} {word}".strip()
+        if len(trial) <= max_chars:
+            current = trial
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines[:8]
+
+
+def build_datasheet_analysis_pdf(result_markdown, prepared_by="SHASHANK C"):
+    """Create a readable dependency-free PDF report without raw JSON details."""
+    page_width, page_height = 842, 595  # A4 landscape points
+    margin_x, margin_y = 28, 30
+    usable_width = page_width - (2 * margin_x)
+    top_y = page_height - margin_y
+    bottom_y = margin_y
+    pages = []
+    current_ops = []
+    y = top_y
+
+    def new_page():
+        nonlocal current_ops, y
+        if current_ops:
+            pages.append(current_ops)
+        current_ops = []
+        y = top_y
+
+    def ensure_space(height):
+        nonlocal y
+        if y - height < bottom_y:
+            new_page()
+
+    def add_text(x, yy, text, size=8, bold=False):
+        font = "F2" if bold else "F1"
+        current_ops.append(f"BT /{font} {size} Tf 1 0 0 1 {x:.2f} {yy:.2f} Tm ({_pdf_escape(text)}) Tj ET")
+
+    def add_line(x1, y1, x2, y2, width=0.3):
+        current_ops.append(f"{width:.2f} w {x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S")
+
+    def add_rect(x, yy, w, h, width=0.3):
+        current_ops.append(f"{width:.2f} w {x:.2f} {yy:.2f} {w:.2f} {h:.2f} re S")
+
+    # Cover/header
+    add_text(margin_x, y, "COMPONENT ENGINEER DATASHEET ANALYSIS REPORT", size=14, bold=True)
+    y -= 18
+    add_text(margin_x, y, f"Prepared by: {prepared_by}", size=10, bold=True)
+    y -= 14
+    add_text(margin_x, y, f"Generated UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}", size=9)
+    y -= 16
+    add_line(margin_x, y, page_width - margin_x, y, width=0.6)
+    y -= 18
+
+    def render_paragraph(text):
+        nonlocal y
+        for line in _wrap_pdf_cell(text, usable_width, 8):
+            ensure_space(12)
+            add_text(margin_x, y, line, size=8)
+            y -= 11
+        y -= 4
+
+    def render_table(rows):
+        nonlocal y
+        if not rows:
+            return
+        max_cols = max(len(r) for r in rows)
+        norm_rows = [r + [""] * (max_cols - len(r)) for r in rows]
+        base_widths = []
+        for idx in range(max_cols):
+            if idx == 0:
+                base_widths.append(92)
+            elif idx == 1:
+                base_widths.append(110)
+            elif idx in (max_cols - 3, max_cols - 2):
+                base_widths.append(74)
+            elif idx == max_cols - 1:
+                base_widths.append(130)
+            else:
+                base_widths.append(115)
+        scale = usable_width / sum(base_widths)
+        widths = [w * scale for w in base_widths]
+        font_size = 6.1 if max_cols >= 6 else 7
+        header_size = 6.4 if max_cols >= 6 else 7.2
+        x_positions = [margin_x]
+        for w in widths[:-1]:
+            x_positions.append(x_positions[-1] + w)
+
+        for row_idx, row in enumerate(norm_rows):
+            wrapped = [_wrap_pdf_cell(cell, widths[c] - 4, header_size if row_idx == 0 else font_size) for c, cell in enumerate(row)]
+            row_h = max(16, max(len(w) for w in wrapped) * (font_size + 2) + 6)
+            ensure_space(row_h + 4)
+            top = y
+            y_bottom = y - row_h
+            for c, cell_lines in enumerate(wrapped):
+                x = x_positions[c]
+                add_rect(x, y_bottom, widths[c], row_h, width=0.25)
+                ty = top - 9
+                for cell_line in cell_lines:
+                    add_text(x + 2, ty, cell_line, size=header_size if row_idx == 0 else font_size, bold=(row_idx == 0))
+                    ty -= font_size + 2
+            y = y_bottom
+        y -= 12
+
+    for block_type, value in _parse_report_blocks(result_markdown):
+        if block_type == "heading":
+            ensure_space(22)
+            add_text(margin_x, y, str(value).upper(), size=11, bold=True)
+            y -= 15
+            add_line(margin_x, y, page_width - margin_x, y, width=0.35)
+            y -= 10
+        elif block_type == "table":
+            render_table(value)
+        else:
+            render_paragraph(value)
+
+    if current_ops:
+        pages.append(current_ops)
+
+    objects = []
+    catalog_id = 1
+    pages_id = 2
+    font_id = 3
+    bold_font_id = 4
+    next_id = 5
+    page_ids = []
+    for ops in pages:
+        page_id = next_id
+        content_id = next_id + 1
+        next_id += 2
+        page_ids.append(page_id)
+        stream = "\n".join(ops).encode("latin-1", errors="replace")
+        objects.append((content_id, b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"))
+        page_obj = f"<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 {font_id} 0 R /F2 {bold_font_id} 0 R >> >> /Contents {content_id} 0 R >>".encode()
+        objects.append((page_id, page_obj))
+
+    kids = " ".join([f"{pid} 0 R" for pid in page_ids])
+    objects.append((catalog_id, f"<< /Type /Catalog /Pages {pages_id} 0 R >>".encode()))
+    objects.append((pages_id, f"<< /Type /Pages /Kids [{kids}] /Count {len(page_ids)} >>".encode()))
+    objects.append((font_id, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"))
+    objects.append((bold_font_id, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"))
+    objects.sort(key=lambda x: x[0])
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = [0] * (max(obj_id for obj_id, _ in objects) + 1)
+    for obj_id, body in objects:
+        offsets[obj_id] = len(out)
+        out.extend(f"{obj_id} 0 obj\n".encode())
+        out.extend(body)
+        out.extend(b"\nendobj\n")
+    xref = len(out)
+    out.extend(f"xref\n0 {len(offsets)}\n".encode())
+    out.extend(b"0000000000 65535 f \n")
+    for obj_id in range(1, len(offsets)):
+        out.extend(f"{offsets[obj_id]:010d} 00000 n \n".encode())
+    out.extend(f"trailer\n<< /Size {len(offsets)} /Root {catalog_id} 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return bytes(out)
+
+
+def download_datasheet_for_gemini(url):
+    url = str(url or "").strip()
+    if not url:
+        return None, "", "No datasheet URL"
+    try:
+        resp = requests.get(url, timeout=35, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        content = resp.content or b""
+        if not content:
+            return None, "", "Downloaded datasheet is empty"
+        if len(content) > DATASHEET_ANALYZER_MAX_BYTES:
+            return None, "", f"Datasheet too large for inline Gemini upload ({len(content)} bytes)"
+        ctype = str(resp.headers.get("Content-Type", "")).split(";")[0].strip().lower()
+        if not ctype:
+            ctype = "application/pdf" if url.lower().split("?")[0].endswith(".pdf") else "application/octet-stream"
+        return content, ctype, ""
+    except Exception as ex:
+        return None, "", str(ex)
+
+
+def build_datasheet_parts_for_gemini(mpn_url_pairs, parametric_context=""):
+    mpn_headers = " | ".join([str(mpn) for mpn, _ in mpn_url_pairs])
+    prompt_lines = [
+        "You are an expert electronics component datasheet analyzer.",
+        "Use datasheet content as the primary source. If a parameter is not visible in the datasheet, use the supplied Mouser/Digi-Key parametric fallback data and mark that source clearly.",
+        "Return complete table-wise comparison data for a component engineer. Do not begin with prose or an apology.",
+        "First output a markdown table under heading: ## Full Component Engineer Parameter Comparison.",
+        f"The table columns must be exactly: Parameter Category | Parameter | {mpn_headers} | Primary Source | Fallback Source | Difference / Risk.",
+        "Include as many rows as the sources support. Required categories: Identification, Manufacturer/Ordering, Basic Electrical, Electrical Limits, Tolerance/Accuracy, Thermal, Package/Mechanical, Mounting/Land Pattern, Soldering/Assembly, Material/Construction, Compliance/Environmental, Lifecycle/Obsolescence, Reliability/Qualification, Packaging/Logistics, Documents/Links, Supply Chain/Market, Application Notes, and Risk Summary.",
+        "Required parameters to search for include: manufacturer, manufacturer part number, part type, value/resistance/capacitance/inductance, tolerance, power rating, voltage rating, rated current, temperature coefficient, operating temperature min/max, package/case, dimensions L/W/H, height, termination/lead finish, mounting type, composition/technology/dielectric, failure rate/reliability, automotive/military/agency approvals, RoHS, REACH, lead free, halogen free, MSL, reflow temperature, soldering time/profile, packaging type, reel quantity, lifecycle/status, datasheet URL, product URL, stock, lead time, and price if available.",
+        "For every MPN cell include the value and source in parentheses, for example: 1.8 kΩ (Datasheet), 1% (Mouser Parametric), or Not found. Use datasheet as Primary Source; use Mouser/Digi-Key parametric only when datasheet value is absent and put that provider in Fallback Source.",
+        "After the full comparison table, output a second markdown table under heading: ## Component Engineer Missing / Fallback Source Audit with columns: MPN | Parameter | Datasheet Status | Mouser/Digi-Key Fallback Status | Final Value | Engineer Note.",
+        "After that output ## Component Engineer Recommendation with bullet points for interchangeability, risks, and what must be verified before approval.",
+        "Do not include raw JSON in the visible report. Keep all output grounded only in datasheets and supplied distributor parametric data.",
+    ]
+    parts = [{"text": "\n".join(prompt_lines)}]
+    if str(parametric_context or "").strip():
+        parts.append({"text": str(parametric_context).strip()})
+    status_rows = []
+    for mpn, url in mpn_url_pairs:
+        content, mime_type, error = download_datasheet_for_gemini(url)
+        if content:
+            parts.append({"text": f"Datasheet for MPN: {mpn}\nSource URL: {url}"})
+            parts.append({"inline_data": {"mime_type": mime_type, "data": base64.b64encode(content).decode("ascii")}})
+            status_rows.append({"MPN": mpn, "Datasheet URL": url, "Status": f"Attached ({mime_type}, {len(content)} bytes)"})
+        else:
+            parts.append({"text": f"MPN: {mpn}\nDatasheet URL: {url or 'Not available'}\nAttachment unavailable: {error}. Use the URL/context if accessible; otherwise report Not found."})
+            status_rows.append({"MPN": mpn, "Datasheet URL": url, "Status": f"URL only / {error}"})
+    return parts, status_rows
+
+
+def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_context="", timeout_sec=None, max_retries=None):
+    api_key = str(api_key or "").strip()
+    model = str(model or GEMINI_MODEL_DEFAULT).strip() or GEMINI_MODEL_DEFAULT
+    if not api_key:
+        raise ValueError("Enter Gemini AI API key in dashboard/sidebar before comparing datasheets.")
+    if not mpn_url_pairs:
+        raise ValueError("Add at least one MPN before running datasheet comparison.")
+
+    timeout_sec = int(timeout_sec or GEMINI_REQUEST_TIMEOUT_SEC)
+    max_retries = max(1, int(max_retries or GEMINI_REQUEST_RETRIES))
+    parts, status_rows = build_datasheet_parts_for_gemini(mpn_url_pairs, parametric_context=parametric_context)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{parse.quote(model, safe='')}:generateContent"
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": 0.05, "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS},
+    }
+
+    last_error = None
+    resp = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(
+                url,
+                params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=(30, timeout_sec),
+            )
+            break
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as ex:
+            last_error = ex
+            if attempt < max_retries:
+                time.sleep(min(10, 2 * attempt))
+                continue
+            raise RuntimeError(
+                f"Gemini request timed out after {timeout_sec}s read timeout and {max_retries} attempt(s). "
+                "Try fewer MPNs, smaller datasheets, a faster Gemini model, or increase GEMINI_REQUEST_TIMEOUT_SEC. "
+                f"Original error: {ex}"
+            )
+    if resp is None:
+        raise RuntimeError(f"Gemini request failed before receiving a response: {last_error}")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text[:1000]}")
+    data = resp.json()
+    text = ""
+    for cand in data.get("candidates", []) or []:
+        for part in cand.get("content", {}).get("parts", []) or []:
+            text += str(part.get("text", ""))
+    return text.strip(), data, status_rows
+
+
+def save_datasheet_analysis(analysis_name, mpn_url_pairs, model, result_markdown, result_json):
+    ensure_datasheet_analysis_table()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO datasheet_analysis_cache
+            (analysis_name, mpns, datasheet_urls, gemini_model, result_markdown, result_json, created_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(analysis_name or "Datasheet comparison").strip(),
+                json.dumps([m for m, _ in mpn_url_pairs], ensure_ascii=False),
+                json.dumps({m: u for m, u in mpn_url_pairs}, ensure_ascii=False),
+                str(model or GEMINI_MODEL_DEFAULT),
+                result_markdown,
+                json.dumps(result_json, ensure_ascii=False),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+
+
 def ensure_scrub_queue_tables():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -2222,8 +2836,23 @@ def run_scrubbing(mpns, user, pwd, is_headless, selected_tabs=None):
         options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
 
-    service = Service(str(BASE_DIR / "chromedriver.exe"))
-    driver = webdriver.Chrome(service=service, options=options)
+    driver = None
+    local_driver = BASE_DIR / "chromedriver.exe"
+    try:
+        if local_driver.exists():
+            # Try local driver first (for offline/restricted environments).
+            driver = webdriver.Chrome(service=Service(str(local_driver)), options=options)
+        else:
+            # Prefer Selenium Manager auto-resolution when no local driver is present.
+            driver = webdriver.Chrome(options=options)
+    except Exception as e:
+        msg = str(e)
+        if "only supports Chrome version" in msg or "session not created" in msg.lower():
+            st.warning("⚠️ Local ChromeDriver version mismatch detected. Retrying with Selenium Manager...")
+            driver = webdriver.Chrome(options=options)
+        else:
+            raise
+
     wait = WebDriverWait(driver, 15)
 
     status = st.empty()
@@ -3142,6 +3771,7 @@ ensure_unified_parts_table()
 ensure_z2_spec_tables()
 ensure_scrub_queue_tables()
 ensure_api_usage_table()
+ensure_datasheet_analysis_table()
 
 st.title("🛡️ Component Engineer")
 ui_tabs = st.tabs([
@@ -3151,6 +3781,7 @@ ui_tabs = st.tabs([
     "📥 Advanced Master Export",
     "🏆 Price Comparison",
     "🛒 Mouser API Live Feed",
+    "🤖 Datasheet Analyzer",
 ])
 
 with ui_tabs[0]:
@@ -3961,7 +4592,7 @@ with ui_tabs[4]:
     show_footer()
     show_footer()
 
-with ui_tabs[4]:
+with ui_tabs[5]:
     st.subheader("Mouser API Realtime Pricing + Datasheet Feed")
     st.caption("Tip: Set environment variable `MOUSER_API_KEY` and avoid hardcoding secrets in source code.")
 
@@ -4051,4 +4682,178 @@ with ui_tabs[4]:
                     file_name="mouser_live_feed.csv",
                     mime="text/csv",
                 )
+    show_footer()
+
+
+with ui_tabs[6]:
+    st.subheader("🤖 Datasheet Analyzer (Gemini AI)")
+    st.caption("Add multiple MPNs, resolve datasheet links from DB first, then Digi-Key/Mouser live APIs (or enter URLs manually), then compare parameters using Gemini AI.")
+
+    if "datasheet_analyzer_mpns" not in st.session_state:
+        st.session_state["datasheet_analyzer_mpns"] = []
+
+    a1, a2 = st.columns([2, 1])
+    new_mpn = a1.text_input("Add MPN", key="datasheet_analyzer_new_mpn")
+    if a2.button("➕ Add MPN", key="datasheet_analyzer_add_btn"):
+        clean_mpn = new_mpn.strip()
+        if clean_mpn and clean_mpn not in st.session_state["datasheet_analyzer_mpns"]:
+            st.session_state["datasheet_analyzer_mpns"].append(clean_mpn)
+
+    bulk_mpns = st.text_area("Or paste multiple MPNs (comma/newline separated)", key="datasheet_analyzer_bulk_mpns")
+    b1, b2 = st.columns(2)
+    if b1.button("➕ Add Bulk MPNs", key="datasheet_analyzer_bulk_add_btn"):
+        for m in re.split(r"[,\n\r\t]+", bulk_mpns or ""):
+            clean_mpn = m.strip()
+            if clean_mpn and clean_mpn not in st.session_state["datasheet_analyzer_mpns"]:
+                st.session_state["datasheet_analyzer_mpns"].append(clean_mpn)
+    if b2.button("🧹 Clear Analyzer List", key="datasheet_analyzer_clear_btn"):
+        st.session_state["datasheet_analyzer_mpns"] = []
+
+    analyzer_mpns = st.session_state.get("datasheet_analyzer_mpns", [])
+    st.write("MPNs queued for datasheet comparison:", analyzer_mpns)
+
+    url_overrides = {}
+    if analyzer_mpns:
+        st.markdown("#### Datasheet URLs")
+        for mpn in analyzer_mpns:
+            default_url = get_datasheet_url_for_mpn(mpn)
+            url_overrides[mpn] = st.text_input(
+                f"Datasheet URL for {mpn}",
+                value=default_url,
+                key=f"datasheet_analyzer_url_{mpn}",
+                help="Auto-filled from unified_part_cache when available; edit/paste if blank or incorrect.",
+            ).strip()
+
+    st.markdown("#### Datasheet Link Sources")
+    source_choice = st.radio(
+        "Auto-find datasheet links from",
+        ["Digi-Key then Mouser", "Mouser then Digi-Key", "DB/manual only"],
+        horizontal=True,
+        key="datasheet_analyzer_source_choice",
+    )
+    source_order = {
+        "Digi-Key then Mouser": ["digikey", "mouser"],
+        "Mouser then Digi-Key": ["mouser", "digikey"],
+        "DB/manual only": [],
+    }.get(source_choice, ["digikey", "mouser"])
+    src1, src2 = st.columns(2)
+    analyzer_mouser_key = src1.text_input(
+        "Mouser API Key (for datasheet link lookup)",
+        value=os.getenv("MOUSER_API_KEY", MOUSER_API_KEY_FALLBACK),
+        type="password",
+        key="datasheet_analyzer_mouser_key",
+    )
+    analyzer_dk_id = src2.text_input(
+        "Digi-Key Client ID (for datasheet link lookup)",
+        value=os.getenv("DIGIKEY_CLIENT_ID", DIGIKEY_CLIENT_ID_FALLBACK),
+        key="datasheet_analyzer_dk_id",
+    )
+    analyzer_dk_secret = src2.text_input(
+        "Digi-Key Client Secret (for datasheet link lookup)",
+        value=os.getenv("DIGIKEY_CLIENT_SECRET", DIGIKEY_CLIENT_SECRET_FALLBACK),
+        type="password",
+        key="datasheet_analyzer_dk_secret",
+    )
+    analyzer_dk_scope = src2.text_input(
+        "Digi-Key Scope (optional)",
+        value=os.getenv("DIGIKEY_SCOPE", ""),
+        key="datasheet_analyzer_dk_scope",
+    )
+    analyzer_dk_sandbox = src2.toggle("Use Digi-Key Sandbox", value=False, key="datasheet_analyzer_dk_sandbox")
+
+    model = st.text_input("Gemini Model", value=GEMINI_MODEL_DEFAULT, key="datasheet_analyzer_model")
+    gctl1, gctl2 = st.columns(2)
+    gemini_timeout_sec = gctl1.number_input(
+        "Gemini read timeout (seconds)",
+        min_value=120,
+        max_value=1800,
+        value=int(GEMINI_REQUEST_TIMEOUT_SEC),
+        step=60,
+        key="datasheet_analyzer_timeout_sec",
+        help="Large datasheet PDFs and full component-engineer tables can take several minutes.",
+    )
+    gemini_retries = gctl2.number_input(
+        "Gemini retry attempts",
+        min_value=1,
+        max_value=5,
+        value=int(GEMINI_REQUEST_RETRIES),
+        step=1,
+        key="datasheet_analyzer_retry_attempts",
+    )
+    api_key = st.text_input(
+        "Gemini AI API Key",
+        value=st.session_state.get("gemini_api_key", GEMINI_API_KEY_FALLBACK),
+        type="password",
+        key="datasheet_analyzer_api_key",
+        help="You can also enter this once in the sidebar Global Settings.",
+    )
+    analysis_name = st.text_input("Analysis Name", value="Datasheet comparison", key="datasheet_analyzer_name")
+
+    if st.button("🔍 Compare Datasheets with Gemini", key="datasheet_analyzer_compare_btn"):
+        try:
+            with st.spinner("Finding datasheet links from DB / Digi-Key / Mouser..."):
+                pairs, resolve_status = resolve_datasheet_urls_for_analyzer(
+                    analyzer_mpns,
+                    manual_urls=url_overrides,
+                    source_order=source_order,
+                    mouser_key=analyzer_mouser_key,
+                    digikey_id=analyzer_dk_id,
+                    digikey_secret=analyzer_dk_secret,
+                    digikey_scope=analyzer_dk_scope,
+                    digikey_sandbox=analyzer_dk_sandbox,
+                )
+            st.markdown("#### Datasheet link resolution")
+            st.dataframe(pd.DataFrame(resolve_status), width="stretch", hide_index=True)
+            with st.spinner("Loading Mouser/Digi-Key parametric fallback data..."):
+                parametric_context, parametric_rows, parametric_status = build_distributor_parametric_context(
+                    analyzer_mpns,
+                    source_order=source_order,
+                    mouser_key=analyzer_mouser_key,
+                    digikey_id=analyzer_dk_id,
+                    digikey_secret=analyzer_dk_secret,
+                    digikey_scope=analyzer_dk_scope,
+                    digikey_sandbox=analyzer_dk_sandbox,
+                )
+            st.markdown("#### Distributor parametric fallback status")
+            st.dataframe(pd.DataFrame(parametric_status), width="stretch", hide_index=True)
+            if parametric_rows:
+                with st.expander("View Mouser/Digi-Key parametric fallback rows", expanded=False):
+                    st.dataframe(pd.DataFrame(parametric_rows), width="stretch", hide_index=True)
+            with st.spinner("Gemini is reading datasheets and extracting table-wise parameters..."):
+                result_text, raw_json, attach_status = call_gemini_datasheet_analysis(api_key, model, pairs, parametric_context=parametric_context, timeout_sec=gemini_timeout_sec, max_retries=gemini_retries)
+                save_datasheet_analysis(analysis_name, pairs, model, result_text, raw_json)
+            st.success("Datasheet analysis complete and saved to DB table: datasheet_analysis_cache")
+            st.markdown("#### Datasheet attachment status")
+            st.dataframe(pd.DataFrame(attach_status), width="stretch", hide_index=True)
+            st.markdown("#### Gemini Datasheet Parameter Comparison")
+            st.markdown(result_text or "No text returned by Gemini.")
+            st.download_button(
+                "⬇️ Download Analysis Markdown",
+                data=(result_text or "").encode("utf-8"),
+                file_name="datasheet_analysis.md",
+                mime="text/markdown",
+                key="datasheet_analyzer_download_md",
+            )
+            pdf_bytes = build_datasheet_analysis_pdf(result_text or "", prepared_by="SHASHANK C")
+            st.download_button(
+                "📄 Download PDF Report - SHASHANK C",
+                data=pdf_bytes,
+                file_name="SHASHANK_C_datasheet_analysis.pdf",
+                mime="application/pdf",
+                key="datasheet_analyzer_download_pdf",
+            )
+        except Exception as ex:
+            st.error(f"Datasheet analyzer failed: {ex}")
+
+    if DB_PATH.exists():
+        with sqlite3.connect(DB_PATH) as conn:
+            history_df = pd.read_sql(
+                "SELECT id, analysis_name, mpns, gemini_model, created_at_utc FROM datasheet_analysis_cache ORDER BY id DESC LIMIT 20",
+                conn,
+            )
+        st.markdown("#### Recent Datasheet Analyses")
+        if history_df.empty:
+            st.caption("No datasheet analyses saved yet.")
+        else:
+            st.dataframe(history_df, width="stretch", hide_index=True)
     show_footer()
