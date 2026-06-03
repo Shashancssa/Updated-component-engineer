@@ -53,6 +53,8 @@ NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "ECZ622yjXXrCVDp
 GEMINI_API_KEY_FALLBACK = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL_DEFAULT = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "24576") or 24576)
+GEMINI_REQUEST_TIMEOUT_SEC = int(os.getenv("GEMINI_REQUEST_TIMEOUT_SEC", "600") or 600)
+GEMINI_REQUEST_RETRIES = int(os.getenv("GEMINI_REQUEST_RETRIES", "2") or 2)
 DATASHEET_ANALYZER_MAX_BYTES = int(os.getenv("DATASHEET_ANALYZER_MAX_BYTES", str(18 * 1024 * 1024)) or (18 * 1024 * 1024))
 _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
@@ -1698,7 +1700,7 @@ def build_datasheet_parts_for_gemini(mpn_url_pairs, parametric_context=""):
     return parts, status_rows
 
 
-def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_context=""):
+def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_context="", timeout_sec=None, max_retries=None):
     api_key = str(api_key or "").strip()
     model = str(model or GEMINI_MODEL_DEFAULT).strip() or GEMINI_MODEL_DEFAULT
     if not api_key:
@@ -1706,19 +1708,39 @@ def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_con
     if not mpn_url_pairs:
         raise ValueError("Add at least one MPN before running datasheet comparison.")
 
+    timeout_sec = int(timeout_sec or GEMINI_REQUEST_TIMEOUT_SEC)
+    max_retries = max(1, int(max_retries or GEMINI_REQUEST_RETRIES))
     parts, status_rows = build_datasheet_parts_for_gemini(mpn_url_pairs, parametric_context=parametric_context)
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{parse.quote(model, safe='')}:generateContent"
     payload = {
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"temperature": 0.05, "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS},
     }
-    resp = requests.post(
-        url,
-        params={"key": api_key},
-        headers={"Content-Type": "application/json"},
-        json=payload,
-        timeout=120,
-    )
+
+    last_error = None
+    resp = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(
+                url,
+                params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=(30, timeout_sec),
+            )
+            break
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as ex:
+            last_error = ex
+            if attempt < max_retries:
+                time.sleep(min(10, 2 * attempt))
+                continue
+            raise RuntimeError(
+                f"Gemini request timed out after {timeout_sec}s read timeout and {max_retries} attempt(s). "
+                "Try fewer MPNs, smaller datasheets, a faster Gemini model, or increase GEMINI_REQUEST_TIMEOUT_SEC. "
+                f"Original error: {ex}"
+            )
+    if resp is None:
+        raise RuntimeError(f"Gemini request failed before receiving a response: {last_error}")
     if resp.status_code >= 400:
         raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text[:1000]}")
     data = resp.json()
@@ -4493,6 +4515,24 @@ with ui_tabs[6]:
     analyzer_dk_sandbox = src2.toggle("Use Digi-Key Sandbox", value=False, key="datasheet_analyzer_dk_sandbox")
 
     model = st.text_input("Gemini Model", value=GEMINI_MODEL_DEFAULT, key="datasheet_analyzer_model")
+    gctl1, gctl2 = st.columns(2)
+    gemini_timeout_sec = gctl1.number_input(
+        "Gemini read timeout (seconds)",
+        min_value=120,
+        max_value=1800,
+        value=int(GEMINI_REQUEST_TIMEOUT_SEC),
+        step=60,
+        key="datasheet_analyzer_timeout_sec",
+        help="Large datasheet PDFs and full component-engineer tables can take several minutes.",
+    )
+    gemini_retries = gctl2.number_input(
+        "Gemini retry attempts",
+        min_value=1,
+        max_value=5,
+        value=int(GEMINI_REQUEST_RETRIES),
+        step=1,
+        key="datasheet_analyzer_retry_attempts",
+    )
     api_key = st.text_input(
         "Gemini AI API Key",
         value=st.session_state.get("gemini_api_key", GEMINI_API_KEY_FALLBACK),
@@ -4533,7 +4573,7 @@ with ui_tabs[6]:
                 with st.expander("View Mouser/Digi-Key parametric fallback rows", expanded=False):
                     st.dataframe(pd.DataFrame(parametric_rows), width="stretch", hide_index=True)
             with st.spinner("Gemini is reading datasheets and extracting table-wise parameters..."):
-                result_text, raw_json, attach_status = call_gemini_datasheet_analysis(api_key, model, pairs, parametric_context=parametric_context)
+                result_text, raw_json, attach_status = call_gemini_datasheet_analysis(api_key, model, pairs, parametric_context=parametric_context, timeout_sec=gemini_timeout_sec, max_retries=gemini_retries)
                 save_datasheet_analysis(analysis_name, pairs, model, result_text, raw_json)
             st.success("Datasheet analysis complete and saved to DB table: datasheet_analysis_cache")
             st.markdown("#### Datasheet attachment status")
