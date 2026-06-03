@@ -53,13 +53,7 @@ NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "ECZ622yjXXrCVDp
 GROQ_API_KEY_FALLBACK = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_FALLBACK = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
-# Backward-compatible aliases for older UI/session code that still references Gemini names.
-# Groq is the active AI decode provider; map legacy Gemini defaults to Groq so stale widgets do not crash startup.
-GEMINI_API_KEY_FALLBACK = GROQ_API_KEY_FALLBACK
-GEMINI_API_KEY_DEFAULT = GROQ_API_KEY_FALLBACK
-GEMINI_MODEL_FALLBACK = GROQ_MODEL_FALLBACK
-GEMINI_MODEL_DEFAULT = GROQ_MODEL_FALLBACK
-GEMINI_CHAT_COMPLETIONS_URL = GROQ_CHAT_COMPLETIONS_URL
+GROQ_REQUEST_TIMEOUT_SEC = float(os.getenv("GROQ_REQUEST_TIMEOUT_SEC", "20") or 20)
 _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
 _API_LAST_CALL_TS = {}
@@ -370,7 +364,7 @@ def _groq_passive_description(row, attributes, groq_key="", groq_model=""):
                 "temperature": 0,
                 "max_tokens": 120,
             },
-            timeout=20,
+            timeout=GROQ_REQUEST_TIMEOUT_SEC,
         )
         if resp.status_code >= 400:
             return ""
