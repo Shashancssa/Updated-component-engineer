@@ -50,12 +50,9 @@ DIGIKEY_CLIENT_ID_FALLBACK = os.getenv("DIGIKEY_CLIENT_ID", "AyNFvUvmDoGUTtIyeDA
 DIGIKEY_CLIENT_SECRET_FALLBACK = os.getenv("DIGIKEY_CLIENT_SECRET", "k5bDnbn49OFWrYQtuQlAgG2YOdeLrr5BCxK8eihKJzDTz3WHQBpnGkN84lLKdwQE")
 NEXAR_CLIENT_ID_FALLBACK = os.getenv("NEXAR_CLIENT_ID", "2000628d-be02-44fc-bfff-f7a90ad13926")
 NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "ECZ622yjXXrCVDpXOmgJHrulfQI3AWJh_sz0")
-GEMINI_API_KEY_FALLBACK = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL_DEFAULT = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "24576") or 24576)
-GEMINI_REQUEST_TIMEOUT_SEC = int(os.getenv("GEMINI_REQUEST_TIMEOUT_SEC", "600") or 600)
-GEMINI_REQUEST_RETRIES = int(os.getenv("GEMINI_REQUEST_RETRIES", "2") or 2)
-DATASHEET_ANALYZER_MAX_BYTES = int(os.getenv("DATASHEET_ANALYZER_MAX_BYTES", str(18 * 1024 * 1024)) or (18 * 1024 * 1024))
+GROQ_API_KEY_FALLBACK = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL_FALLBACK = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
 _API_LAST_CALL_TS = {}
@@ -92,8 +89,15 @@ MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_WORKERS", "48") or 48)
 st.set_page_config(layout="wide", page_title="COMPONENT ENGINEER DATABASE", page_icon="🛡️")
 
 
-def connect_db():
-    return sqlite3.connect(DB_PATH, timeout=30)
+def connect_db(timeout=30):
+    conn = sqlite3.connect(DB_PATH, timeout=timeout)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout={int(max(1000, timeout * 1000))}")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+    return conn
 
 
 def ensure_api_usage_table():
@@ -316,6 +320,65 @@ def _decoded_passive_description(row, attributes):
     return decoded
 
 
+
+def _groq_passive_description(row, attributes, groq_key="", groq_model=""):
+    """Use optional Groq AI to normalize passive descriptions when a key is provided."""
+    api_key = str(groq_key or "").strip()
+    if not api_key or not isinstance(row, dict):
+        return ""
+    category = str(row.get("Category", "") or row.get("category", "")).strip()
+    desc = str(row.get("Description", "") or row.get("description", "")).strip()
+    if not _is_passive_component(category, desc):
+        return ""
+    compact_attrs = []
+    if isinstance(attributes, list):
+        for attr in attributes[:30]:
+            if not isinstance(attr, dict):
+                continue
+            name = str(attr.get("Attribute", "")).strip()
+            value = str(attr.get("Value", "")).strip()
+            if name and value:
+                compact_attrs.append({"Attribute": name, "Value": value})
+    prompt = (
+        "Decode this electronic passive component description using datasheet ordering-information style. "
+        "Return only one concise single-line description in this sequence when available: "
+        "component type, value, tolerance, rating/power/voltage/current, package/case, temperature coefficient/range. "
+        "Do not add markdown, explanations, unknown fields, or invented values.\n"
+        f"MPN: {row.get('Requested MPN', '')}\n"
+        f"Manufacturer Part Number: {row.get('Manufacturer Part Number', '')}\n"
+        f"Category: {category}\n"
+        f"Original Description: {desc}\n"
+        f"Attributes JSON: {json.dumps(compact_attrs, ensure_ascii=False)[:3500]}"
+    )
+    try:
+        resp = requests.post(
+            GROQ_CHAT_COMPLETIONS_URL,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": str(groq_model or GROQ_MODEL_FALLBACK).strip() or GROQ_MODEL_FALLBACK,
+                "messages": [
+                    {"role": "system", "content": "You normalize electronic component descriptions from distributor attributes."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0,
+                "max_tokens": 120,
+            },
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            return ""
+        data = resp.json()
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+        content = re.sub(r"[\r\n]+", " ", str(content or "")).strip().strip('"')
+        return content[:500]
+    except Exception:
+        return ""
+
+
 def normalize_mpn(value):
     txt = str(value or "").strip()
     if not txt:
@@ -348,7 +411,7 @@ def _is_effectively_empty(value):
     return txt.lower() in {"none", "null", "nan", "n/a", "na", "-"}
 
 
-def add_enrichment_fields(parts, attributes, pricing):
+def add_enrichment_fields(parts, attributes, pricing, groq_key="", groq_model="", use_groq_decode=False):
     """
     Add normalized fields requested for DB/export compatibility:
     MSD LEVEL, REFLOW SOLDERING TEMPERATURE, THERMAL CYCLE,
@@ -373,8 +436,15 @@ def add_enrichment_fields(parts, attributes, pricing):
         if not isinstance(row, dict):
             continue
         decoded_desc = _decoded_passive_description(row, attributes)
+        decode_source = "Ordering Attributes" if decoded_desc else ""
+        if use_groq_decode and str(groq_key or "").strip():
+            groq_desc = _groq_passive_description(row, attributes, groq_key=groq_key, groq_model=groq_model)
+            if groq_desc:
+                decoded_desc = groq_desc
+                decode_source = "Groq AI"
         if decoded_desc:
             row["Description"] = decoded_desc
+            row["DESCRIPTION DECODE SOURCE"] = decode_source
         row["MSD LEVEL"] = row.get("MSD LEVEL", "") or msd
         row["REFLOW SOLDERING TEMPERATURE"] = row.get("REFLOW SOLDERING TEMPERATURE", "") or reflow
         row["THERMAL CYCLE"] = row.get("THERMAL CYCLE", "") or thermal_cycle
@@ -3094,7 +3164,7 @@ def _rotating_priority_for_index(idx, split_mode=False):
     return rr_base[start:] + rr_base[:start]
 
 
-def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", priority_order=None, save_to_cells=False, fill_empty_from_fallback=True):
+def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", priority_order=None, save_to_cells=False, fill_empty_from_fallback=True, groq_key="", groq_model="", use_groq_decode=False):
     """
     For missing scraper MPNs, fetch from live sources (default priority: Digi-Key -> Mouser)
     and save into same DB via live_part_cache + unified_part_cache.
@@ -3268,7 +3338,7 @@ def fetch_live_into_db_for_mpn(mpn, mouser_key="", digikey_id="", digikey_secret
             merged_attrs.extend(p.get("attributes", []) if isinstance(p.get("attributes", []), list) else [])
             merged_docs.extend(p.get("documents", []) if isinstance(p.get("documents", []), list) else [])
 
-        merged_parts = add_enrichment_fields([merged_part], merged_attrs, merged_pricing)
+        merged_parts = add_enrichment_fields([merged_part], merged_attrs, merged_pricing, groq_key=groq_key, groq_model=groq_model, use_groq_decode=use_groq_decode)
         return {
             "parts": merged_parts,
             "pricing": merged_pricing,
@@ -3377,7 +3447,7 @@ def enqueue_scrub_queue_from_upload(file_obj):
     return {"queued": queued, "skipped": skipped, "error": ""}
 
 
-def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4):
+def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, groq_key="", groq_model="", use_groq_decode=False):
     ensure_scrub_queue_tables()
     batch_size = max(1, int(batch_size or 1))
     processed = []
@@ -3413,6 +3483,9 @@ def process_scrub_queue_batch(batch_size, mouser_key="", digikey_id="", digikey_
                 priority_order=_rotating_priority_for_index(zero_idx, split_mode=False),
                 save_to_cells=True,
                 fill_empty_from_fallback=fill_empty_from_fallback,
+                groq_key=groq_key,
+                groq_model=groq_model,
+                use_groq_decode=use_groq_decode,
             )
             if isinstance(raw_out, dict):
                 out = raw_out
@@ -3586,7 +3659,7 @@ def requeue_stale_in_progress_rows(stale_seconds=300):
     return changed
 
 
-def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=400):
+def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", digikey_scope="", fill_empty_from_fallback=True, max_workers=4, internal_chunk_size=400, groq_key="", groq_model="", use_groq_decode=False):
     """Drain the full pending/error queue without exposing batch controls in UI."""
     all_rows = []
     if not internal_chunk_size or int(internal_chunk_size) <= 0:
@@ -3600,6 +3673,9 @@ def process_scrub_queue_all(mouser_key="", digikey_id="", digikey_secret="", dig
             digikey_scope=digikey_scope,
             fill_empty_from_fallback=fill_empty_from_fallback,
             max_workers=max_workers,
+            groq_key=groq_key,
+            groq_model=groq_model,
+            use_groq_decode=use_groq_decode,
         )
         if not one_round:
             break
@@ -3782,6 +3858,10 @@ with ui_tabs[0]:
     live_workers = st.number_input("Live combo parallel workers", min_value=1, max_value=MAX_PARALLEL_WORKERS, value=min(24, MAX_PARALLEL_WORKERS), step=1, key="live_combo_workers")
     st.caption("Tip: Use 16-32 workers with High Speed Mode to target ~100 MPN/min (API/network dependent).")
     live_fill_empty = st.toggle("Fill empty fields from next providers (fallback)", value=True, key="live_combo_fill_empty")
+    live_groq_key = st.text_input("Groq API Key (Optional, for AI passive decode)", value=GROQ_API_KEY_FALLBACK, type="password", key="live_groq_key")
+    live_groq_model = st.text_input("Groq Model", value=GROQ_MODEL_FALLBACK, key="live_groq_model")
+    live_use_groq_decode = st.toggle("Use Groq AI to improve passive descriptions", value=bool(GROQ_API_KEY_FALLBACK), key="live_use_groq_decode")
+    st.caption("Groq is used only for AI description cleanup/decode; Mouser/Digi-Key are still needed for live component data.")
     if st.button("Start Live Combo Scraper", key="live_combo_run"):
         live_mpns = []
         live_mpns.extend(_read_mpn_list_from_upload(live_up))
@@ -3812,6 +3892,9 @@ with ui_tabs[0]:
                     priority_order=_rotating_priority_for_index(zero_idx, split_mode=effective_split_mode),
                     save_to_cells=True,
                     fill_empty_from_fallback=effective_fill_empty,
+                    groq_key=live_groq_key,
+                    groq_model=live_groq_model,
+                    use_groq_decode=live_use_groq_decode,
                 )
             rows = process_mpns_concurrently(live_mpns, _live_worker, max_workers=effective_workers)
             bar.progress(100)
@@ -3835,6 +3918,9 @@ with ui_tabs[0]:
     bg_fill_empty = bgc2.toggle("Queue fallback fill empty fields", value=True, key="bg_fill_empty")
     bg_high_speed = bgc2.toggle("🚀 Queue High Speed Mode (Digi-Key first hit)", value=True, key="bg_high_speed")
     bg_workers = bgc2.number_input("Queue parallel workers", min_value=1, max_value=MAX_PARALLEL_WORKERS, value=min(32, MAX_PARALLEL_WORKERS), step=1, key="bg_workers")
+    bg_groq_key = bgc2.text_input("Queue Groq API Key (Optional, AI passive decode)", value=GROQ_API_KEY_FALLBACK, type="password", key="bg_groq_key")
+    bg_groq_model = bgc2.text_input("Queue Groq Model", value=GROQ_MODEL_FALLBACK, key="bg_groq_model")
+    bg_use_groq_decode = bgc2.toggle("Use Groq AI passive decode in queue", value=bool(GROQ_API_KEY_FALLBACK), key="bg_use_groq_decode")
     if SQLITE_QUEUE_SERIAL_MODE:
         st.caption("SQLite safe mode is ON: queue writes are serialized (effective workers = 1) to avoid database lock errors.")
     auto_run_on_enqueue = bgc2.toggle("Auto-run queue after adding file", value=True, key="bg_auto_run_on_enqueue")
@@ -3891,6 +3977,9 @@ with ui_tabs[0]:
                     fill_empty_from_fallback=(False if bg_high_speed else bg_fill_empty),
                     max_workers=effective_bg_workers,
                     internal_chunk_size=0,
+                    groq_key=bg_groq_key,
+                    groq_model=bg_groq_model,
+                    use_groq_decode=bg_use_groq_decode,
                 )
                 if processed:
                     if any(str(x.get("status", "")).lower() == "limit_reached" for x in processed if isinstance(x, dict)):
@@ -3915,6 +4004,9 @@ with ui_tabs[0]:
             fill_empty_from_fallback=(False if bg_high_speed else bg_fill_empty),
             max_workers=effective_bg_workers,
             internal_chunk_size=0,
+            groq_key=bg_groq_key,
+            groq_model=bg_groq_model,
+            use_groq_decode=bg_use_groq_decode,
         )
         if not all_processed:
             st.info("No pending queue rows. Queue is idle.")
