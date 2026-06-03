@@ -50,6 +50,9 @@ DIGIKEY_CLIENT_ID_FALLBACK = os.getenv("DIGIKEY_CLIENT_ID", "AyNFvUvmDoGUTtIyeDA
 DIGIKEY_CLIENT_SECRET_FALLBACK = os.getenv("DIGIKEY_CLIENT_SECRET", "k5bDnbn49OFWrYQtuQlAgG2YOdeLrr5BCxK8eihKJzDTz3WHQBpnGkN84lLKdwQE")
 NEXAR_CLIENT_ID_FALLBACK = os.getenv("NEXAR_CLIENT_ID", "2000628d-be02-44fc-bfff-f7a90ad13926")
 NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "ECZ622yjXXrCVDpXOmgJHrulfQI3AWJh_sz0")
+GEMINI_API_KEY_FALLBACK = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL_DEFAULT = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DATASHEET_ANALYZER_MAX_BYTES = int(os.getenv("DATASHEET_ANALYZER_MAX_BYTES", str(18 * 1024 * 1024)) or (18 * 1024 * 1024))
 _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
 _API_LAST_CALL_TS = {}
@@ -166,6 +169,12 @@ def show_sidebar_logo():
         st.sidebar.image(str(LOGO_PATH), width="stretch")
     st.sidebar.title("⚙️ Global Settings")
     mode = st.sidebar.toggle("Headless Mode (Background)", value=True)
+    st.session_state["gemini_api_key"] = st.sidebar.text_input(
+        "Gemini AI API Key",
+        value=st.session_state.get("gemini_api_key", GEMINI_API_KEY_FALLBACK),
+        type="password",
+        help="Used by Datasheet Analyzer only for this running dashboard session.",
+    )
     return mode
 
 def show_footer():
@@ -1308,6 +1317,137 @@ def ensure_unified_parts_table():
         conn.commit()
 
 
+
+def ensure_datasheet_analysis_table():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS datasheet_analysis_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_name TEXT,
+                mpns TEXT NOT NULL,
+                datasheet_urls TEXT,
+                gemini_model TEXT,
+                result_markdown TEXT,
+                result_json TEXT,
+                created_at_utc TEXT NOT NULL
+            );
+            """
+        )
+        conn.commit()
+
+
+def get_datasheet_url_for_mpn(mpn):
+    mpn = str(mpn or "").strip()
+    if not mpn or not DB_PATH.exists():
+        return ""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT datasheet_url FROM unified_part_cache WHERE UPPER(TRIM(mpn))=UPPER(TRIM(?))",
+                (mpn,),
+            ).fetchone()
+            if row and str(row[0] or "").strip():
+                return str(row[0]).strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def download_datasheet_for_gemini(url):
+    url = str(url or "").strip()
+    if not url:
+        return None, "", "No datasheet URL"
+    try:
+        resp = requests.get(url, timeout=35, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        content = resp.content or b""
+        if not content:
+            return None, "", "Downloaded datasheet is empty"
+        if len(content) > DATASHEET_ANALYZER_MAX_BYTES:
+            return None, "", f"Datasheet too large for inline Gemini upload ({len(content)} bytes)"
+        ctype = str(resp.headers.get("Content-Type", "")).split(";")[0].strip().lower()
+        if not ctype:
+            ctype = "application/pdf" if url.lower().split("?")[0].endswith(".pdf") else "application/octet-stream"
+        return content, ctype, ""
+    except Exception as ex:
+        return None, "", str(ex)
+
+
+def build_datasheet_parts_for_gemini(mpn_url_pairs):
+    prompt_lines = [
+        "You are an expert electronics component datasheet analyzer.",
+        "Compare the supplied MPN datasheets and extract all important electrical, mechanical, compliance, lifecycle, soldering, package, reliability, and ordering parameters.",
+        "Return two sections: (1) a concise comparison table with MPNs as rows and parameters as columns, and (2) a JSON object named extracted_parameters mapping each MPN to parameter/value/source_note entries.",
+        "If a value is not present, write Not found. Highlight key differences and risks.",
+    ]
+    parts = [{"text": "\n".join(prompt_lines)}]
+    status_rows = []
+    for mpn, url in mpn_url_pairs:
+        content, mime_type, error = download_datasheet_for_gemini(url)
+        if content:
+            parts.append({"text": f"Datasheet for MPN: {mpn}\nSource URL: {url}"})
+            parts.append({"inline_data": {"mime_type": mime_type, "data": base64.b64encode(content).decode("ascii")}})
+            status_rows.append({"MPN": mpn, "Datasheet URL": url, "Status": f"Attached ({mime_type}, {len(content)} bytes)"})
+        else:
+            parts.append({"text": f"MPN: {mpn}\nDatasheet URL: {url or 'Not available'}\nAttachment unavailable: {error}. Use the URL/context if accessible; otherwise report Not found."})
+            status_rows.append({"MPN": mpn, "Datasheet URL": url, "Status": f"URL only / {error}"})
+    return parts, status_rows
+
+
+def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs):
+    api_key = str(api_key or "").strip()
+    model = str(model or GEMINI_MODEL_DEFAULT).strip() or GEMINI_MODEL_DEFAULT
+    if not api_key:
+        raise ValueError("Enter Gemini AI API key in dashboard/sidebar before comparing datasheets.")
+    if not mpn_url_pairs:
+        raise ValueError("Add at least one MPN before running datasheet comparison.")
+
+    parts, status_rows = build_datasheet_parts_for_gemini(mpn_url_pairs)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{parse.quote(model, safe='')}:generateContent"
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192},
+    }
+    resp = requests.post(
+        url,
+        params={"key": api_key},
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=120,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text[:1000]}")
+    data = resp.json()
+    text = ""
+    for cand in data.get("candidates", []) or []:
+        for part in cand.get("content", {}).get("parts", []) or []:
+            text += str(part.get("text", ""))
+    return text.strip(), data, status_rows
+
+
+def save_datasheet_analysis(analysis_name, mpn_url_pairs, model, result_markdown, result_json):
+    ensure_datasheet_analysis_table()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO datasheet_analysis_cache
+            (analysis_name, mpns, datasheet_urls, gemini_model, result_markdown, result_json, created_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(analysis_name or "Datasheet comparison").strip(),
+                json.dumps([m for m, _ in mpn_url_pairs], ensure_ascii=False),
+                json.dumps({m: u for m, u in mpn_url_pairs}, ensure_ascii=False),
+                str(model or GEMINI_MODEL_DEFAULT),
+                result_markdown,
+                json.dumps(result_json, ensure_ascii=False),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+
+
 def ensure_scrub_queue_tables():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -2146,8 +2286,23 @@ def run_scrubbing(mpns, user, pwd, is_headless, selected_tabs=None):
         options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
 
-    service = Service(str(BASE_DIR / "chromedriver.exe"))
-    driver = webdriver.Chrome(service=service, options=options)
+    driver = None
+    local_driver = BASE_DIR / "chromedriver.exe"
+    try:
+        if local_driver.exists():
+            # Try local driver first (for offline/restricted environments).
+            driver = webdriver.Chrome(service=Service(str(local_driver)), options=options)
+        else:
+            # Prefer Selenium Manager auto-resolution when no local driver is present.
+            driver = webdriver.Chrome(options=options)
+    except Exception as e:
+        msg = str(e)
+        if "only supports Chrome version" in msg or "session not created" in msg.lower():
+            st.warning("⚠️ Local ChromeDriver version mismatch detected. Retrying with Selenium Manager...")
+            driver = webdriver.Chrome(options=options)
+        else:
+            raise
+
     wait = WebDriverWait(driver, 15)
 
     status = st.empty()
@@ -3060,6 +3215,7 @@ ensure_unified_parts_table()
 ensure_z2_spec_tables()
 ensure_scrub_queue_tables()
 ensure_api_usage_table()
+ensure_datasheet_analysis_table()
 
 st.title("🛡️ Component Engineer")
 ui_tabs = st.tabs([
@@ -3069,6 +3225,7 @@ ui_tabs = st.tabs([
     "📥 Advanced Master Export",
     "🏆 Price Comparison",
     "🛒 Mouser API Live Feed",
+    "🤖 Datasheet Analyzer",
 ])
 
 with ui_tabs[0]:
@@ -3863,7 +4020,7 @@ with ui_tabs[4]:
     show_footer()
     show_footer()
 
-with ui_tabs[4]:
+with ui_tabs[5]:
     st.subheader("Mouser API Realtime Pricing + Datasheet Feed")
     st.caption("Tip: Set environment variable `MOUSER_API_KEY` and avoid hardcoding secrets in source code.")
 
@@ -3953,4 +4110,88 @@ with ui_tabs[4]:
                     file_name="mouser_live_feed.csv",
                     mime="text/csv",
                 )
+    show_footer()
+
+
+with ui_tabs[6]:
+    st.subheader("🤖 Datasheet Analyzer (Gemini AI)")
+    st.caption("Add multiple MPNs, resolve their datasheet links from the DB (or enter URLs manually), then compare parameters using Gemini AI.")
+
+    if "datasheet_analyzer_mpns" not in st.session_state:
+        st.session_state["datasheet_analyzer_mpns"] = []
+
+    a1, a2 = st.columns([2, 1])
+    new_mpn = a1.text_input("Add MPN", key="datasheet_analyzer_new_mpn")
+    if a2.button("➕ Add MPN", key="datasheet_analyzer_add_btn"):
+        clean_mpn = new_mpn.strip()
+        if clean_mpn and clean_mpn not in st.session_state["datasheet_analyzer_mpns"]:
+            st.session_state["datasheet_analyzer_mpns"].append(clean_mpn)
+
+    bulk_mpns = st.text_area("Or paste multiple MPNs (comma/newline separated)", key="datasheet_analyzer_bulk_mpns")
+    b1, b2 = st.columns(2)
+    if b1.button("➕ Add Bulk MPNs", key="datasheet_analyzer_bulk_add_btn"):
+        for m in re.split(r"[,\n\r\t]+", bulk_mpns or ""):
+            clean_mpn = m.strip()
+            if clean_mpn and clean_mpn not in st.session_state["datasheet_analyzer_mpns"]:
+                st.session_state["datasheet_analyzer_mpns"].append(clean_mpn)
+    if b2.button("🧹 Clear Analyzer List", key="datasheet_analyzer_clear_btn"):
+        st.session_state["datasheet_analyzer_mpns"] = []
+
+    analyzer_mpns = st.session_state.get("datasheet_analyzer_mpns", [])
+    st.write("MPNs queued for datasheet comparison:", analyzer_mpns)
+
+    url_overrides = {}
+    if analyzer_mpns:
+        st.markdown("#### Datasheet URLs")
+        for mpn in analyzer_mpns:
+            default_url = get_datasheet_url_for_mpn(mpn)
+            url_overrides[mpn] = st.text_input(
+                f"Datasheet URL for {mpn}",
+                value=default_url,
+                key=f"datasheet_analyzer_url_{mpn}",
+                help="Auto-filled from unified_part_cache when available; edit/paste if blank or incorrect.",
+            ).strip()
+
+    model = st.text_input("Gemini Model", value=GEMINI_MODEL_DEFAULT, key="datasheet_analyzer_model")
+    api_key = st.text_input(
+        "Gemini AI API Key",
+        value=st.session_state.get("gemini_api_key", GEMINI_API_KEY_FALLBACK),
+        type="password",
+        key="datasheet_analyzer_api_key",
+        help="You can also enter this once in the sidebar Global Settings.",
+    )
+    analysis_name = st.text_input("Analysis Name", value="Datasheet comparison", key="datasheet_analyzer_name")
+
+    if st.button("🔍 Compare Datasheets with Gemini", key="datasheet_analyzer_compare_btn"):
+        pairs = [(mpn, url_overrides.get(mpn, "")) for mpn in analyzer_mpns]
+        try:
+            with st.spinner("Gemini is reading datasheets and extracting parameters..."):
+                result_text, raw_json, attach_status = call_gemini_datasheet_analysis(api_key, model, pairs)
+                save_datasheet_analysis(analysis_name, pairs, model, result_text, raw_json)
+            st.success("Datasheet analysis complete and saved to DB table: datasheet_analysis_cache")
+            st.markdown("#### Datasheet attachment status")
+            st.dataframe(pd.DataFrame(attach_status), width="stretch", hide_index=True)
+            st.markdown("#### Gemini Datasheet Parameter Comparison")
+            st.markdown(result_text or "No text returned by Gemini.")
+            st.download_button(
+                "⬇️ Download Analysis Markdown",
+                data=(result_text or "").encode("utf-8"),
+                file_name="datasheet_analysis.md",
+                mime="text/markdown",
+                key="datasheet_analyzer_download_md",
+            )
+        except Exception as ex:
+            st.error(f"Datasheet analyzer failed: {ex}")
+
+    if DB_PATH.exists():
+        with sqlite3.connect(DB_PATH) as conn:
+            history_df = pd.read_sql(
+                "SELECT id, analysis_name, mpns, gemini_model, created_at_utc FROM datasheet_analysis_cache ORDER BY id DESC LIMIT 20",
+                conn,
+            )
+        st.markdown("#### Recent Datasheet Analyses")
+        if history_df.empty:
+            st.caption("No datasheet analyses saved yet.")
+        else:
+            st.dataframe(history_df, width="stretch", hide_index=True)
     show_footer()
