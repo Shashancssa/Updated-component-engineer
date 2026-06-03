@@ -1566,71 +1566,226 @@ def _pdf_escape(text):
     return str(text or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
-def _markdown_to_pdf_lines(markdown_text, width=112):
+def _strip_json_from_report(markdown_text):
     text = str(markdown_text or "").replace("\r\n", "\n").replace("\r", "\n")
-    lines = []
-    for raw in text.split("\n"):
-        line = raw.replace("**", "").replace("__", "").replace("`", "").strip()
-        if line.startswith("#"):
-            line = line.lstrip("#").strip().upper()
-        if not line:
-            lines.append("")
+    markers = ["```json", "extracted_parameters", "{\n", "\n{"]
+    cut_positions = [text.find(m) for m in markers if text.find(m) >= 0]
+    if cut_positions:
+        text = text[:min(cut_positions)].rstrip()
+    return text
+
+
+def _clean_pdf_text(text):
+    return (
+        str(text or "")
+        .replace("**", "")
+        .replace("__", "")
+        .replace("`", "")
+        .replace("<br>", " ")
+        .replace("<br/>", " ")
+        .strip()
+    )
+
+
+def _split_markdown_table_row(row):
+    row = str(row or "").strip()
+    if row.startswith("|"):
+        row = row[1:]
+    if row.endswith("|"):
+        row = row[:-1]
+    return [_clean_pdf_text(c) for c in row.split("|")]
+
+
+def _is_markdown_separator(row):
+    cells = _split_markdown_table_row(row)
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", c.replace(" ", "")) for c in cells if c)
+
+
+def _parse_report_blocks(markdown_text):
+    text = _strip_json_from_report(markdown_text)
+    lines = text.split("\n")
+    blocks = []
+    i = 0
+    while i < len(lines):
+        raw = lines[i].strip()
+        if not raw:
+            i += 1
             continue
-        while len(line) > width:
-            cut = line.rfind(" ", 0, width)
-            if cut <= 20:
-                cut = width
-            lines.append(line[:cut].strip())
-            line = line[cut:].strip()
-        lines.append(line)
-    return lines
+        if raw.startswith("|") and i + 1 < len(lines) and _is_markdown_separator(lines[i + 1]):
+            rows = [_split_markdown_table_row(raw)]
+            i += 2
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                if not _is_markdown_separator(lines[i]):
+                    rows.append(_split_markdown_table_row(lines[i]))
+                i += 1
+            blocks.append(("table", rows))
+            continue
+        if raw.startswith("#"):
+            blocks.append(("heading", _clean_pdf_text(raw.lstrip("#"))))
+        else:
+            blocks.append(("text", _clean_pdf_text(raw)))
+        i += 1
+    return blocks
+
+
+def _wrap_pdf_cell(text, width, font_size):
+    text = _clean_pdf_text(text)
+    max_chars = max(8, int(width / (font_size * 0.48)))
+    words = text.split()
+    if not words:
+        return [""]
+    lines = []
+    current = ""
+    for word in words:
+        if len(word) > max_chars:
+            if current:
+                lines.append(current)
+                current = ""
+            while len(word) > max_chars:
+                lines.append(word[:max_chars])
+                word = word[max_chars:]
+        trial = f"{current} {word}".strip()
+        if len(trial) <= max_chars:
+            current = trial
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines[:8]
 
 
 def build_datasheet_analysis_pdf(result_markdown, prepared_by="SHASHANK C"):
-    """Create a dependency-free PDF report for the Gemini datasheet analysis."""
+    """Create a readable dependency-free PDF report without raw JSON details."""
     page_width, page_height = 842, 595  # A4 landscape points
-    margin_x, top_y, line_h = 36, 545, 12
-    lines = [
-        "COMPONENT ENGINEER DATASHEET ANALYSIS REPORT",
-        f"Prepared by: {prepared_by}",
-        f"Generated UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
-        "",
-    ] + _markdown_to_pdf_lines(result_markdown, width=128)
-
+    margin_x, margin_y = 28, 30
+    usable_width = page_width - (2 * margin_x)
+    top_y = page_height - margin_y
+    bottom_y = margin_y
     pages = []
-    per_page = max(1, int((top_y - 36) / line_h))
-    for i in range(0, len(lines), per_page):
-        pages.append(lines[i:i + per_page])
+    current_ops = []
+    y = top_y
+
+    def new_page():
+        nonlocal current_ops, y
+        if current_ops:
+            pages.append(current_ops)
+        current_ops = []
+        y = top_y
+
+    def ensure_space(height):
+        nonlocal y
+        if y - height < bottom_y:
+            new_page()
+
+    def add_text(x, yy, text, size=8, bold=False):
+        font = "F2" if bold else "F1"
+        current_ops.append(f"BT /{font} {size} Tf 1 0 0 1 {x:.2f} {yy:.2f} Tm ({_pdf_escape(text)}) Tj ET")
+
+    def add_line(x1, y1, x2, y2, width=0.3):
+        current_ops.append(f"{width:.2f} w {x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S")
+
+    def add_rect(x, yy, w, h, width=0.3):
+        current_ops.append(f"{width:.2f} w {x:.2f} {yy:.2f} {w:.2f} {h:.2f} re S")
+
+    # Cover/header
+    add_text(margin_x, y, "COMPONENT ENGINEER DATASHEET ANALYSIS REPORT", size=14, bold=True)
+    y -= 18
+    add_text(margin_x, y, f"Prepared by: {prepared_by}", size=10, bold=True)
+    y -= 14
+    add_text(margin_x, y, f"Generated UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}", size=9)
+    y -= 16
+    add_line(margin_x, y, page_width - margin_x, y, width=0.6)
+    y -= 18
+
+    def render_paragraph(text):
+        nonlocal y
+        for line in _wrap_pdf_cell(text, usable_width, 8):
+            ensure_space(12)
+            add_text(margin_x, y, line, size=8)
+            y -= 11
+        y -= 4
+
+    def render_table(rows):
+        nonlocal y
+        if not rows:
+            return
+        max_cols = max(len(r) for r in rows)
+        norm_rows = [r + [""] * (max_cols - len(r)) for r in rows]
+        base_widths = []
+        for idx in range(max_cols):
+            if idx == 0:
+                base_widths.append(92)
+            elif idx == 1:
+                base_widths.append(110)
+            elif idx in (max_cols - 3, max_cols - 2):
+                base_widths.append(74)
+            elif idx == max_cols - 1:
+                base_widths.append(130)
+            else:
+                base_widths.append(115)
+        scale = usable_width / sum(base_widths)
+        widths = [w * scale for w in base_widths]
+        font_size = 6.1 if max_cols >= 6 else 7
+        header_size = 6.4 if max_cols >= 6 else 7.2
+        x_positions = [margin_x]
+        for w in widths[:-1]:
+            x_positions.append(x_positions[-1] + w)
+
+        for row_idx, row in enumerate(norm_rows):
+            wrapped = [_wrap_pdf_cell(cell, widths[c] - 4, header_size if row_idx == 0 else font_size) for c, cell in enumerate(row)]
+            row_h = max(16, max(len(w) for w in wrapped) * (font_size + 2) + 6)
+            ensure_space(row_h + 4)
+            top = y
+            y_bottom = y - row_h
+            for c, cell_lines in enumerate(wrapped):
+                x = x_positions[c]
+                add_rect(x, y_bottom, widths[c], row_h, width=0.25)
+                ty = top - 9
+                for cell_line in cell_lines:
+                    add_text(x + 2, ty, cell_line, size=header_size if row_idx == 0 else font_size, bold=(row_idx == 0))
+                    ty -= font_size + 2
+            y = y_bottom
+        y -= 12
+
+    for block_type, value in _parse_report_blocks(result_markdown):
+        if block_type == "heading":
+            ensure_space(22)
+            add_text(margin_x, y, str(value).upper(), size=11, bold=True)
+            y -= 15
+            add_line(margin_x, y, page_width - margin_x, y, width=0.35)
+            y -= 10
+        elif block_type == "table":
+            render_table(value)
+        else:
+            render_paragraph(value)
+
+    if current_ops:
+        pages.append(current_ops)
 
     objects = []
     catalog_id = 1
     pages_id = 2
     font_id = 3
-    next_id = 4
+    bold_font_id = 4
+    next_id = 5
     page_ids = []
-    content_ids = []
-
-    for page_lines in pages:
+    for ops in pages:
         page_id = next_id
         content_id = next_id + 1
         next_id += 2
         page_ids.append(page_id)
-        content_ids.append(content_id)
-        y = top_y
-        stream_lines = ["BT", "/F1 9 Tf", "11 TL"]
-        for line in page_lines:
-            stream_lines.append(f"1 0 0 1 {margin_x} {y} Tm ({_pdf_escape(line)}) Tj")
-            y -= line_h
-        stream_lines.append("ET")
-        stream = "\n".join(stream_lines).encode("latin-1", errors="replace")
+        stream = "\n".join(ops).encode("latin-1", errors="replace")
         objects.append((content_id, b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"))
-        page_obj = f"<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>".encode()
+        page_obj = f"<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 {font_id} 0 R /F2 {bold_font_id} 0 R >> >> /Contents {content_id} 0 R >>".encode()
         objects.append((page_id, page_obj))
 
     kids = " ".join([f"{pid} 0 R" for pid in page_ids])
     objects.append((catalog_id, f"<< /Type /Catalog /Pages {pages_id} 0 R >>".encode()))
     objects.append((pages_id, f"<< /Type /Pages /Kids [{kids}] /Count {len(page_ids)} >>".encode()))
     objects.append((font_id, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"))
+    objects.append((bold_font_id, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"))
     objects.sort(key=lambda x: x[0])
 
     out = bytearray(b"%PDF-1.4\n")
@@ -1682,7 +1837,7 @@ def build_datasheet_parts_for_gemini(mpn_url_pairs, parametric_context=""):
         "For every MPN cell include the value and source in parentheses, for example: 1.8 kΩ (Datasheet), 1% (Mouser Parametric), or Not found. Use datasheet as Primary Source; use Mouser/Digi-Key parametric only when datasheet value is absent and put that provider in Fallback Source.",
         "After the full comparison table, output a second markdown table under heading: ## Component Engineer Missing / Fallback Source Audit with columns: MPN | Parameter | Datasheet Status | Mouser/Digi-Key Fallback Status | Final Value | Engineer Note.",
         "After that output ## Component Engineer Recommendation with bullet points for interchangeability, risks, and what must be verified before approval.",
-        "Finally output a compact JSON object named extracted_parameters. Keep all output grounded only in datasheets and supplied distributor parametric data.",
+        "Do not include raw JSON in the visible report. Keep all output grounded only in datasheets and supplied distributor parametric data.",
     ]
     parts = [{"text": "\n".join(prompt_lines)}]
     if str(parametric_context or "").strip():
