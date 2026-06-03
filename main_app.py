@@ -52,6 +52,7 @@ NEXAR_CLIENT_ID_FALLBACK = os.getenv("NEXAR_CLIENT_ID", "2000628d-be02-44fc-bfff
 NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "ECZ622yjXXrCVDpXOmgJHrulfQI3AWJh_sz0")
 GEMINI_API_KEY_FALLBACK = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL_DEFAULT = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "24576") or 24576)
 DATASHEET_ANALYZER_MAX_BYTES = int(os.getenv("DATASHEET_ANALYZER_MAX_BYTES", str(18 * 1024 * 1024)) or (18 * 1024 * 1024))
 _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
@@ -1559,6 +1560,93 @@ def build_distributor_parametric_context(
     return "\n".join(lines), rows, status_rows
 
 
+def _pdf_escape(text):
+    return str(text or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _markdown_to_pdf_lines(markdown_text, width=112):
+    text = str(markdown_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    for raw in text.split("\n"):
+        line = raw.replace("**", "").replace("__", "").replace("`", "").strip()
+        if line.startswith("#"):
+            line = line.lstrip("#").strip().upper()
+        if not line:
+            lines.append("")
+            continue
+        while len(line) > width:
+            cut = line.rfind(" ", 0, width)
+            if cut <= 20:
+                cut = width
+            lines.append(line[:cut].strip())
+            line = line[cut:].strip()
+        lines.append(line)
+    return lines
+
+
+def build_datasheet_analysis_pdf(result_markdown, prepared_by="SHASHANK C"):
+    """Create a dependency-free PDF report for the Gemini datasheet analysis."""
+    page_width, page_height = 842, 595  # A4 landscape points
+    margin_x, top_y, line_h = 36, 545, 12
+    lines = [
+        "COMPONENT ENGINEER DATASHEET ANALYSIS REPORT",
+        f"Prepared by: {prepared_by}",
+        f"Generated UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ] + _markdown_to_pdf_lines(result_markdown, width=128)
+
+    pages = []
+    per_page = max(1, int((top_y - 36) / line_h))
+    for i in range(0, len(lines), per_page):
+        pages.append(lines[i:i + per_page])
+
+    objects = []
+    catalog_id = 1
+    pages_id = 2
+    font_id = 3
+    next_id = 4
+    page_ids = []
+    content_ids = []
+
+    for page_lines in pages:
+        page_id = next_id
+        content_id = next_id + 1
+        next_id += 2
+        page_ids.append(page_id)
+        content_ids.append(content_id)
+        y = top_y
+        stream_lines = ["BT", "/F1 9 Tf", "11 TL"]
+        for line in page_lines:
+            stream_lines.append(f"1 0 0 1 {margin_x} {y} Tm ({_pdf_escape(line)}) Tj")
+            y -= line_h
+        stream_lines.append("ET")
+        stream = "\n".join(stream_lines).encode("latin-1", errors="replace")
+        objects.append((content_id, b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"))
+        page_obj = f"<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>".encode()
+        objects.append((page_id, page_obj))
+
+    kids = " ".join([f"{pid} 0 R" for pid in page_ids])
+    objects.append((catalog_id, f"<< /Type /Catalog /Pages {pages_id} 0 R >>".encode()))
+    objects.append((pages_id, f"<< /Type /Pages /Kids [{kids}] /Count {len(page_ids)} >>".encode()))
+    objects.append((font_id, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"))
+    objects.sort(key=lambda x: x[0])
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = [0] * (max(obj_id for obj_id, _ in objects) + 1)
+    for obj_id, body in objects:
+        offsets[obj_id] = len(out)
+        out.extend(f"{obj_id} 0 obj\n".encode())
+        out.extend(body)
+        out.extend(b"\nendobj\n")
+    xref = len(out)
+    out.extend(f"xref\n0 {len(offsets)}\n".encode())
+    out.extend(b"0000000000 65535 f \n")
+    for obj_id in range(1, len(offsets)):
+        out.extend(f"{offsets[obj_id]:010d} 00000 n \n".encode())
+    out.extend(f"trailer\n<< /Size {len(offsets)} /Root {catalog_id} 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return bytes(out)
+
+
 def download_datasheet_for_gemini(url):
     url = str(url or "").strip()
     if not url:
@@ -1584,12 +1672,14 @@ def build_datasheet_parts_for_gemini(mpn_url_pairs, parametric_context=""):
     prompt_lines = [
         "You are an expert electronics component datasheet analyzer.",
         "Use datasheet content as the primary source. If a parameter is not visible in the datasheet, use the supplied Mouser/Digi-Key parametric fallback data and mark that source clearly.",
-        "Return table-wise comparison data. Do not begin with prose or an apology.",
-        "First output a markdown table under heading: ## Datasheet + Distributor Parameter Comparison.",
-        f"The table columns must be: Parameter Category | Parameter | {mpn_headers} | Source Used | Difference / Risk.",
-        "Include rows for resistance/value, tolerance, power rating, rated current, voltage, temperature coefficient, package/case, dimensions, operating temperature, technology/composition, mounting, lifecycle/status, RoHS, REACH, halogen/lead-free, MSL, solder/reflow, packaging/reel quantity, datasheet link, manufacturer, and any other important datasheet parameters found.",
-        "In each MPN cell include the value and source in parentheses, for example: 1.8 kΩ (Datasheet), 1% (Mouser Parametric), or Not found.",
-        "After the comparison table, output a second markdown table under heading: ## Missing / Fallback Source Audit with columns: MPN | Parameter | Datasheet Status | Fallback Source | Final Value.",
+        "Return complete table-wise comparison data for a component engineer. Do not begin with prose or an apology.",
+        "First output a markdown table under heading: ## Full Component Engineer Parameter Comparison.",
+        f"The table columns must be exactly: Parameter Category | Parameter | {mpn_headers} | Primary Source | Fallback Source | Difference / Risk.",
+        "Include as many rows as the sources support. Required categories: Identification, Manufacturer/Ordering, Basic Electrical, Electrical Limits, Tolerance/Accuracy, Thermal, Package/Mechanical, Mounting/Land Pattern, Soldering/Assembly, Material/Construction, Compliance/Environmental, Lifecycle/Obsolescence, Reliability/Qualification, Packaging/Logistics, Documents/Links, Supply Chain/Market, Application Notes, and Risk Summary.",
+        "Required parameters to search for include: manufacturer, manufacturer part number, part type, value/resistance/capacitance/inductance, tolerance, power rating, voltage rating, rated current, temperature coefficient, operating temperature min/max, package/case, dimensions L/W/H, height, termination/lead finish, mounting type, composition/technology/dielectric, failure rate/reliability, automotive/military/agency approvals, RoHS, REACH, lead free, halogen free, MSL, reflow temperature, soldering time/profile, packaging type, reel quantity, lifecycle/status, datasheet URL, product URL, stock, lead time, and price if available.",
+        "For every MPN cell include the value and source in parentheses, for example: 1.8 kΩ (Datasheet), 1% (Mouser Parametric), or Not found. Use datasheet as Primary Source; use Mouser/Digi-Key parametric only when datasheet value is absent and put that provider in Fallback Source.",
+        "After the full comparison table, output a second markdown table under heading: ## Component Engineer Missing / Fallback Source Audit with columns: MPN | Parameter | Datasheet Status | Mouser/Digi-Key Fallback Status | Final Value | Engineer Note.",
+        "After that output ## Component Engineer Recommendation with bullet points for interchangeability, risks, and what must be verified before approval.",
         "Finally output a compact JSON object named extracted_parameters. Keep all output grounded only in datasheets and supplied distributor parametric data.",
     ]
     parts = [{"text": "\n".join(prompt_lines)}]
@@ -1620,7 +1710,7 @@ def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_con
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{parse.quote(model, safe='')}:generateContent"
     payload = {
         "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192},
+        "generationConfig": {"temperature": 0.05, "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS},
     }
     resp = requests.post(
         url,
@@ -4456,6 +4546,14 @@ with ui_tabs[6]:
                 file_name="datasheet_analysis.md",
                 mime="text/markdown",
                 key="datasheet_analyzer_download_md",
+            )
+            pdf_bytes = build_datasheet_analysis_pdf(result_text or "", prepared_by="SHASHANK C")
+            st.download_button(
+                "📄 Download PDF Report - SHASHANK C",
+                data=pdf_bytes,
+                file_name="SHASHANK_C_datasheet_analysis.pdf",
+                mime="application/pdf",
+                key="datasheet_analyzer_download_pdf",
             )
         except Exception as ex:
             st.error(f"Datasheet analyzer failed: {ex}")
