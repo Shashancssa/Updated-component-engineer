@@ -54,15 +54,20 @@ NEXAR_CLIENT_ID_FALLBACK = os.getenv("NEXAR_CLIENT_ID", "2000628d-be02-44fc-bfff
 NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "ECZ622yjXXrCVDpXOmgJHrulfQI3AWJh_sz0")
 GROQ_API_KEY_FALLBACK = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_FALLBACK = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+OLLAMA_BASE_URL_FALLBACK = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL_FALLBACK = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_REQUEST_TIMEOUT_SEC = float(os.getenv("GROQ_REQUEST_TIMEOUT_SEC", "20") or 20)
 DATASHEET_AI_UI_TIMEOUT_MIN_SEC = 120
 DATASHEET_AI_REQUEST_TIMEOUT_SEC = max(DATASHEET_AI_UI_TIMEOUT_MIN_SEC, int(GROQ_REQUEST_TIMEOUT_SEC))
 DATASHEET_AI_REQUEST_RETRIES = int(os.getenv("DATASHEET_AI_REQUEST_RETRIES", "2") or 2)
-DATASHEET_AI_MAX_OUTPUT_TOKENS = int(os.getenv("DATASHEET_AI_MAX_OUTPUT_TOKENS", "8192") or 8192)
+DATASHEET_AI_MAX_OUTPUT_TOKENS = int(os.getenv("DATASHEET_AI_MAX_OUTPUT_TOKENS", "2200") or 2200)
+DATASHEET_AI_MAX_REQUEST_CHARS = int(os.getenv("DATASHEET_AI_MAX_REQUEST_CHARS", "22000") or 22000)
+DATASHEET_PARAMETRIC_MAX_ROWS = int(os.getenv("DATASHEET_PARAMETRIC_MAX_ROWS", "90") or 90)
+DATASHEET_PARAMETRIC_VALUE_MAX_CHARS = int(os.getenv("DATASHEET_PARAMETRIC_VALUE_MAX_CHARS", "160") or 160)
 DATASHEET_ANALYZER_MAX_BYTES = int(os.getenv("DATASHEET_ANALYZER_MAX_BYTES", "12000000") or 12000000)
-DATASHEET_ANALYZER_MAX_TEXT_CHARS = int(os.getenv("DATASHEET_ANALYZER_MAX_TEXT_CHARS", "70000") or 70000)
-DATASHEET_ANALYZER_MAX_TEXT_CHARS_PER_FILE = int(os.getenv("DATASHEET_ANALYZER_MAX_TEXT_CHARS_PER_FILE", "35000") or 35000)
+DATASHEET_ANALYZER_MAX_TEXT_CHARS = int(os.getenv("DATASHEET_ANALYZER_MAX_TEXT_CHARS", "12000") or 12000)
+DATASHEET_ANALYZER_MAX_TEXT_CHARS_PER_FILE = int(os.getenv("DATASHEET_ANALYZER_MAX_TEXT_CHARS_PER_FILE", "6000") or 6000)
 _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
 _API_LAST_CALL_TS = {}
@@ -1642,10 +1647,26 @@ def build_distributor_parametric_context(
         "Distributor parametric fallback data below. Use this only when the datasheet attachment/link does not contain a value.",
         "Each row has MPN | Source | Parameter | Value.",
     ]
-    for row in rows[:500]:
-        lines.append(f"{row['MPN']} | {row['Source']} | {row['Parameter']} | {row['Value']}")
-    if len(rows) > 500:
-        lines.append(f"... truncated {len(rows) - 500} additional distributor parametric rows ...")
+    max_rows = max(10, int(DATASHEET_PARAMETRIC_MAX_ROWS))
+    max_value_chars = max(40, int(DATASHEET_PARAMETRIC_VALUE_MAX_CHARS))
+    priority_terms = (
+        "manufacturer", "part number", "description", "category", "capacit", "resistance",
+        "voltage", "current", "tolerance", "temperature", "package", "case", "size",
+        "dimension", "lifecycle", "rohs", "reach", "msl", "mount", "termination",
+        "stock", "lead time", "data sheet", "product url", "packaging",
+    )
+    priority_rows = [
+        row for row in rows
+        if any(term in str(row.get("Parameter", "")).lower() for term in priority_terms)
+    ]
+    selected_rows = (priority_rows + [row for row in rows if row not in priority_rows])[:max_rows]
+    for row in selected_rows:
+        value = str(row.get("Value", "") or "").strip()
+        if len(value) > max_value_chars:
+            value = value[:max_value_chars].rstrip() + "..."
+        lines.append(f"{row['MPN']} | {row['Source']} | {row['Parameter']} | {value}")
+    if len(rows) > len(selected_rows):
+        lines.append(f"... truncated {len(rows) - len(selected_rows)} additional distributor parametric rows to keep the AI request within token limits ...")
     return "\n".join(lines), rows, status_rows
 
 
@@ -2077,6 +2098,64 @@ def build_datasheet_messages_for_ai(mpn_url_pairs, parametric_context=""):
     return messages, status_rows
 
 
+
+def _trim_ai_messages_to_limit(messages, max_chars=None):
+    max_chars = max(4000, int(max_chars or DATASHEET_AI_MAX_REQUEST_CHARS))
+    trimmed = [dict(msg) for msg in messages]
+    total_chars = sum(len(str(msg.get("content", "") or "")) for msg in trimmed)
+    if total_chars <= max_chars:
+        return trimmed
+    for msg in trimmed:
+        if msg.get("role") == "user":
+            content = str(msg.get("content", "") or "")
+            keep = max_chars - sum(len(str(other.get("content", "") or "")) for other in trimmed if other is not msg)
+            keep = max(2500, keep)
+            if len(content) > keep:
+                msg["content"] = content[:keep].rstrip() + "\n\n[AI input truncated to avoid provider token-per-minute/request limits. Reduce MPN count or use local Ollama for larger analyses.]"
+            break
+    return trimmed
+
+
+def _datasheet_ai_limit_error(provider, response_text):
+    return (
+        f"{provider} request is too large for the selected model/account limit. "
+        "I reduced the default datasheet text, distributor rows, and output tokens, but this run still exceeded the provider limit. "
+        "Try 1-2 MPNs at a time, lower DATASHEET_ANALYZER_MAX_TEXT_CHARS / DATASHEET_AI_MAX_OUTPUT_TOKENS, "
+        "or use the new local Ollama option with qwen3:8b for offline/no-cloud limits. "
+        f"Provider response: {str(response_text or '')[:1000]}"
+    )
+
+
+def call_ollama_datasheet_analysis(base_url, model, mpn_url_pairs, parametric_context="", timeout_sec=None):
+    base_url = str(base_url or OLLAMA_BASE_URL_FALLBACK).strip().rstrip("/") or OLLAMA_BASE_URL_FALLBACK
+    model = str(model or OLLAMA_MODEL_FALLBACK).strip() or OLLAMA_MODEL_FALLBACK
+    if not mpn_url_pairs:
+        raise ValueError("Add at least one MPN before running datasheet comparison.")
+    timeout_sec = int(timeout_sec or DATASHEET_AI_REQUEST_TIMEOUT_SEC)
+    messages, status_rows = build_datasheet_messages_for_ai(mpn_url_pairs, parametric_context=parametric_context)
+    messages = _trim_ai_messages_to_limit(messages, max_chars=max(int(DATASHEET_AI_MAX_REQUEST_CHARS), 30000))
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {"temperature": 0.05, "num_predict": int(DATASHEET_AI_MAX_OUTPUT_TOKENS)},
+    }
+    try:
+        resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=(10, timeout_sec))
+    except requests.exceptions.ConnectionError as ex:
+        raise RuntimeError(
+            "Could not connect to local Ollama. Install/start Ollama, run `ollama pull qwen3:8b`, "
+            f"and confirm {base_url} is reachable. Original error: {ex}"
+        )
+    except requests.exceptions.ReadTimeout as ex:
+        raise RuntimeError(f"Ollama request timed out after {timeout_sec}s. Try fewer MPNs or a smaller model. Original error: {ex}")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Ollama API error {resp.status_code}: {resp.text[:1000]}")
+    data = resp.json()
+    text = str(data.get("message", {}).get("content", "") or "").strip()
+    return text, data, status_rows
+
+
 def call_groq_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_context="", timeout_sec=None, max_retries=None):
     api_key = str(api_key or "").strip()
     model = str(model or GROQ_MODEL_FALLBACK).strip() or GROQ_MODEL_FALLBACK
@@ -2088,11 +2167,12 @@ def call_groq_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_conte
     timeout_sec = int(timeout_sec or DATASHEET_AI_REQUEST_TIMEOUT_SEC)
     max_retries = max(1, int(max_retries or DATASHEET_AI_REQUEST_RETRIES))
     messages, status_rows = build_datasheet_messages_for_ai(mpn_url_pairs, parametric_context=parametric_context)
+    messages = _trim_ai_messages_to_limit(messages, max_chars=DATASHEET_AI_MAX_REQUEST_CHARS)
     payload = {
         "model": model,
         "messages": messages,
         "temperature": 0.05,
-        "max_tokens": DATASHEET_AI_MAX_OUTPUT_TOKENS,
+        "max_tokens": int(DATASHEET_AI_MAX_OUTPUT_TOKENS),
     }
 
     last_error = None
@@ -2118,6 +2198,21 @@ def call_groq_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_conte
             )
     if resp is None:
         raise RuntimeError(f"Groq request failed before receiving a response: {last_error}")
+    if resp.status_code == 413:
+        compact_payload = dict(payload)
+        compact_payload["messages"] = _trim_ai_messages_to_limit(messages, max_chars=min(9000, max(4000, int(DATASHEET_AI_MAX_REQUEST_CHARS) // 2)))
+        compact_payload["max_tokens"] = min(int(DATASHEET_AI_MAX_OUTPUT_TOKENS), 1200)
+        try:
+            resp = requests.post(
+                GROQ_CHAT_COMPLETIONS_URL,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=compact_payload,
+                timeout=(30, timeout_sec),
+            )
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as ex:
+            raise RuntimeError(f"Groq compact retry failed before receiving a response: {ex}")
+    if resp.status_code in {413, 429}:
+        raise RuntimeError(_datasheet_ai_limit_error("Groq", resp.text))
     if resp.status_code >= 400:
         raise RuntimeError(f"Groq API error {resp.status_code}: {resp.text[:1000]}")
     data = resp.json()
@@ -4836,8 +4931,8 @@ with ui_tabs[5]:
 
 
 with ui_tabs[6]:
-    st.subheader("🤖 Datasheet Analyzer (Groq AI)")
-    st.caption("Add multiple MPNs, resolve datasheet links from DB first, then Digi-Key/Mouser live APIs (or enter URLs manually), then compare parameters using Groq AI.")
+    st.subheader("🤖 Datasheet Analyzer (Cloud Groq / Local Ollama)")
+    st.caption("Add MPNs, resolve datasheet links from DB/Digi-Key/Mouser, fetch PDFs in memory only, extract text, then compare with Groq cloud or local Ollama. PDFs are not saved to the database.")
 
     if "datasheet_analyzer_mpns" not in st.session_state:
         st.session_state["datasheet_analyzer_mpns"] = []
@@ -4911,16 +5006,42 @@ with ui_tabs[6]:
     )
     analyzer_dk_sandbox = src2.toggle("Use Digi-Key Sandbox", value=False, key="datasheet_analyzer_dk_sandbox")
 
-    model = st.text_input("Groq Model", value=GROQ_MODEL_FALLBACK, key="datasheet_analyzer_model")
+    ai_provider = st.radio(
+        "Datasheet AI engine",
+        ["Groq Cloud (smaller requests)", "Ollama Local (offline, larger/private)"],
+        horizontal=True,
+        key="datasheet_analyzer_ai_provider",
+        help="Groq cloud has TPM/request limits. Ollama runs locally after you install Ollama and pull a model such as qwen3:8b.",
+    )
+    use_ollama = ai_provider.startswith("Ollama")
+    if use_ollama:
+        model = st.text_input("Ollama Model", value=OLLAMA_MODEL_FALLBACK, key="datasheet_analyzer_ollama_model")
+        ollama_base_url = st.text_input(
+            "Ollama Base URL",
+            value=OLLAMA_BASE_URL_FALLBACK,
+            key="datasheet_analyzer_ollama_base_url",
+            help="Default local Ollama API. First run: ollama pull qwen3:8b",
+        )
+        api_key = ""
+    else:
+        model = st.text_input("Groq Model", value=GROQ_MODEL_FALLBACK, key="datasheet_analyzer_groq_model")
+        ollama_base_url = ""
+        api_key = st.text_input(
+            "Groq AI API Key",
+            value=st.session_state.get("datasheet_ai_api_key", GROQ_API_KEY_FALLBACK),
+            type="password",
+            key="datasheet_analyzer_api_key",
+            help="Groq cloud has strict token-per-minute limits; use fewer MPNs or Ollama for larger/private analyses.",
+        )
     gctl1, gctl2 = st.columns(2)
     ai_timeout_sec = gctl1.number_input(
-        "Groq read timeout (seconds)",
+        "AI read timeout (seconds)",
         min_value=120,
         max_value=1800,
         value=int(DATASHEET_AI_REQUEST_TIMEOUT_SEC),
         step=60,
         key="datasheet_analyzer_timeout_sec",
-        help="Large datasheet PDFs and full component-engineer tables can take several minutes.",
+        help="Large datasheets can take several minutes. PDFs are fetched in memory and are not stored.",
     )
     ai_retries = gctl2.number_input(
         "Groq retry attempts",
@@ -4929,17 +5050,25 @@ with ui_tabs[6]:
         value=int(DATASHEET_AI_REQUEST_RETRIES),
         step=1,
         key="datasheet_analyzer_retry_attempts",
+        disabled=use_ollama,
+        help="Only used by Groq cloud. Ollama requests run locally once per click.",
     )
-    api_key = st.text_input(
-        "Groq AI API Key",
-        value=st.session_state.get("datasheet_ai_api_key", GROQ_API_KEY_FALLBACK),
-        type="password",
-        key="datasheet_analyzer_api_key",
-        help="You can also enter this once in the sidebar Global Settings.",
+    st.caption(
+        f"Current AI request guard: max input {DATASHEET_AI_MAX_REQUEST_CHARS:,} chars, "
+        f"datasheet text {DATASHEET_ANALYZER_MAX_TEXT_CHARS:,} chars total, "
+        f"output {DATASHEET_AI_MAX_OUTPUT_TOKENS:,} tokens. "
+        "These defaults prevent Groq 413/TPM errors; Ollama can be used for larger offline/private jobs."
     )
+    with st.expander("Offline Ollama setup / no PDF storage note", expanded=False):
+        st.markdown(
+            "- Install Ollama once, then run: `ollama pull qwen3:8b`.\n"
+            "- Keep Ollama running and choose **Ollama Local** above. Default URL: `http://localhost:11434`.\n"
+            "- This app fetches datasheet PDFs into memory only for text extraction; it does **not** save PDF files or raw extracted text in the database.\n"
+            "- The database stores only the final analysis/result rows, keeping storage small."
+        )
     analysis_name = st.text_input("Analysis Name", value="Datasheet comparison", key="datasheet_analyzer_name")
 
-    if st.button("🔍 Compare Datasheets with Groq", key="datasheet_analyzer_compare_btn"):
+    if st.button("🔍 Compare Datasheets with AI", key="datasheet_analyzer_compare_btn"):
         try:
             with st.spinner("Finding datasheet links from DB / Digi-Key / Mouser..."):
                 pairs, resolve_status = resolve_datasheet_urls_for_analyzer(
@@ -4969,14 +5098,18 @@ with ui_tabs[6]:
             if parametric_rows:
                 with st.expander("View Mouser/Digi-Key parametric fallback rows", expanded=False):
                     st.dataframe(pd.DataFrame(parametric_rows), width="stretch", hide_index=True)
-            with st.spinner("Groq is analyzing datasheet context and extracting table-wise parameters..."):
-                result_text, raw_json, attach_status = call_groq_datasheet_analysis(api_key, model, pairs, parametric_context=parametric_context, timeout_sec=ai_timeout_sec, max_retries=ai_retries)
-                save_datasheet_analysis(analysis_name, pairs, model, result_text, raw_json)
+            provider_label = "Ollama" if use_ollama else "Groq"
+            with st.spinner(f"{provider_label} is analyzing datasheet context and extracting table-wise parameters..."):
+                if use_ollama:
+                    result_text, raw_json, attach_status = call_ollama_datasheet_analysis(ollama_base_url, model, pairs, parametric_context=parametric_context, timeout_sec=ai_timeout_sec)
+                else:
+                    result_text, raw_json, attach_status = call_groq_datasheet_analysis(api_key, model, pairs, parametric_context=parametric_context, timeout_sec=ai_timeout_sec, max_retries=ai_retries)
+                save_datasheet_analysis(analysis_name, pairs, f"{provider_label}: {model}", result_text, raw_json)
             st.success("Datasheet analysis complete and saved to DB table: datasheet_analysis_cache")
             st.markdown("#### Datasheet attachment status")
             st.dataframe(pd.DataFrame(attach_status), width="stretch", hide_index=True)
-            st.markdown("#### Groq Datasheet Parameter Comparison")
-            st.markdown(result_text or "No text returned by Groq.")
+            st.markdown(f"#### {provider_label} Datasheet Parameter Comparison")
+            st.markdown(result_text or f"No text returned by {provider_label}.")
             st.download_button(
                 "⬇️ Download Analysis Markdown",
                 data=(result_text or "").encode("utf-8"),
