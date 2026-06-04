@@ -9,6 +9,8 @@ import re
 import os
 import json
 import difflib
+import importlib
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from datetime import datetime, timezone
@@ -58,6 +60,9 @@ DATASHEET_AI_UI_TIMEOUT_MIN_SEC = 120
 DATASHEET_AI_REQUEST_TIMEOUT_SEC = max(DATASHEET_AI_UI_TIMEOUT_MIN_SEC, int(GROQ_REQUEST_TIMEOUT_SEC))
 DATASHEET_AI_REQUEST_RETRIES = int(os.getenv("DATASHEET_AI_REQUEST_RETRIES", "2") or 2)
 DATASHEET_AI_MAX_OUTPUT_TOKENS = int(os.getenv("DATASHEET_AI_MAX_OUTPUT_TOKENS", "8192") or 8192)
+DATASHEET_ANALYZER_MAX_BYTES = int(os.getenv("DATASHEET_ANALYZER_MAX_BYTES", "12000000") or 12000000)
+DATASHEET_ANALYZER_MAX_TEXT_CHARS = int(os.getenv("DATASHEET_ANALYZER_MAX_TEXT_CHARS", "70000") or 70000)
+DATASHEET_ANALYZER_MAX_TEXT_CHARS_PER_FILE = int(os.getenv("DATASHEET_ANALYZER_MAX_TEXT_CHARS_PER_FILE", "35000") or 35000)
 _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
 _API_LAST_CALL_TS = {}
@@ -1906,36 +1911,162 @@ def download_datasheet_for_ai(url):
         return None, "", str(ex)
 
 
+
+def _normalize_extracted_datasheet_text(text):
+    text = str(text or "")
+    text = text.replace("\x00", " ")
+    text = re.sub(r"[\t\r\f\v]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
+
+
+def _pdf_string_unescape(value):
+    value = value.replace(r"\(", "(").replace(r"\)", ")").replace(r"\\", "\\")
+    value = value.replace(r"\n", "\n").replace(r"\r", "\n").replace(r"\t", " ")
+    return value
+
+
+def _extract_text_with_pypdf(content):
+    if importlib.util.find_spec("pypdf") is None:
+        return ""
+    pypdf = importlib.import_module("pypdf")
+    reader = pypdf.PdfReader(io.BytesIO(content))
+    pages = []
+    for page in reader.pages[:12]:
+        pages.append(page.extract_text() or "")
+    return _normalize_extracted_datasheet_text("\n\n".join(pages))
+
+
+def _extract_text_from_pdf_streams(content):
+    """Best-effort PDF text extraction without mandatory third-party packages."""
+    extracted_chunks = []
+    for match in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", content, flags=re.S):
+        stream = match.group(1).strip(b"\r\n")
+        candidates = [stream]
+        try:
+            candidates.append(zlib.decompress(stream))
+        except Exception:
+            pass
+        for candidate in candidates:
+            try:
+                decoded = candidate.decode("latin-1", errors="ignore")
+            except Exception:
+                continue
+            pieces = []
+            for text_match in re.finditer(r"\((?:\\.|[^\\()])*\)\s*T[Jj]", decoded):
+                pieces.append(_pdf_string_unescape(text_match.group(0)[1:].rsplit(")", 1)[0]))
+            for array_match in re.finditer(r"\[(.*?)\]\s*TJ", decoded, flags=re.S):
+                array_text = " ".join(
+                    _pdf_string_unescape(item.group(0)[1:-1])
+                    for item in re.finditer(r"\((?:\\.|[^\\()])*\)", array_match.group(1))
+                )
+                if array_text.strip():
+                    pieces.append(array_text)
+            if pieces:
+                extracted_chunks.append("\n".join(pieces))
+    return _normalize_extracted_datasheet_text("\n".join(extracted_chunks))
+
+
+def extract_datasheet_text(content, mime_type, url=""):
+    mime_type = str(mime_type or "").lower()
+    url = str(url or "").lower()
+    if "pdf" in mime_type or url.split("?")[0].endswith(".pdf"):
+        text = _extract_text_with_pypdf(content)
+        if text:
+            return text, "PDF text extracted with pypdf"
+        text = _extract_text_from_pdf_streams(content)
+        if text:
+            return text, "PDF text extracted with built-in fallback"
+        return "", "PDF downloaded, but selectable text could not be extracted locally"
+
+    if "html" in mime_type:
+        raw = content.decode("utf-8", errors="ignore")
+        raw = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
+        raw = re.sub(r"(?s)<[^>]+>", " ", raw)
+        return _normalize_extracted_datasheet_text(raw), "HTML/text extracted"
+
+    if "text" in mime_type or "json" in mime_type or "xml" in mime_type:
+        return _normalize_extracted_datasheet_text(content.decode("utf-8", errors="ignore")), "Text extracted"
+
+    return "", f"Unsupported datasheet content type for local text extraction: {mime_type or 'unknown'}"
+
+
 def build_datasheet_messages_for_ai(mpn_url_pairs, parametric_context=""):
     mpn_headers = " | ".join([str(mpn) for mpn, _ in mpn_url_pairs])
     prompt_lines = [
         "You are an expert electronics component datasheet analyzer.",
-        "Use the supplied datasheet links/status and Mouser/Digi-Key parametric fallback data to produce a grounded component-engineering comparison.",
+        "Use the supplied extracted datasheet text as the PRIMARY source. Only use Mouser/Digi-Key parametric fallback data when a value is missing from extracted datasheet text.",
         "Return complete table-wise comparison data for a component engineer. Do not begin with prose or an apology.",
         "First output a markdown table under heading: ## Full Component Engineer Parameter Comparison.",
         f"The table columns must be exactly: Parameter Category | Parameter | {mpn_headers} | Primary Source | Fallback Source | Difference / Risk.",
         "Include as many rows as the supplied sources support. Required categories: Identification, Manufacturer/Ordering, Basic Electrical, Electrical Limits, Tolerance/Accuracy, Thermal, Package/Mechanical, Mounting/Land Pattern, Soldering/Assembly, Material/Construction, Compliance/Environmental, Lifecycle/Obsolescence, Reliability/Qualification, Packaging/Logistics, Documents/Links, Supply Chain/Market, Application Notes, and Risk Summary.",
         "Required parameters to search for include: manufacturer, manufacturer part number, part type, value/resistance/capacitance/inductance, tolerance, power rating, voltage rating, rated current, temperature coefficient, operating temperature min/max, package/case, dimensions L/W/H, height, termination/lead finish, mounting type, composition/technology/dielectric, failure rate/reliability, automotive/military/agency approvals, RoHS, REACH, lead free, halogen free, MSL, reflow temperature, soldering time/profile, packaging type, reel quantity, lifecycle/status, datasheet URL, product URL, stock, lead time, and price if available.",
-        "For every MPN cell include the value and source in parentheses, for example: 1.8 kΩ (Datasheet Link), 1% (Mouser Parametric), or Not found. Use Mouser/Digi-Key parametric only when datasheet data is absent and put that provider in Fallback Source.",
+        "For every MPN cell include the value and source in parentheses, for example: 1.8 kΩ (Datasheet), 1% (Mouser Parametric), or Not found. Put the exact source used in Primary Source or Fallback Source.",
+        "In Difference / Risk, clearly call out true engineering differences and also call out when differences are only ordering-code, packaging, stock, or lead-time differences.",
         "After the full comparison table, output a second markdown table under heading: ## Component Engineer Missing / Fallback Source Audit with columns: MPN | Parameter | Datasheet Status | Mouser/Digi-Key Fallback Status | Final Value | Engineer Note.",
+        "After that output ## Datasheet Evidence Notes with short bullets listing the most important datasheet excerpts used for the comparison.",
         "After that output ## Component Engineer Recommendation with bullet points for interchangeability, risks, and what must be verified before approval.",
-        "Do not include raw JSON in the visible report. Keep all output grounded only in datasheet links/status and supplied distributor parametric data.",
+        "Do not include raw JSON in the visible report. Keep all output grounded only in extracted datasheet text, datasheet links/status, and supplied distributor parametric data.",
     ]
     status_rows = []
-    datasheet_lines = ["## Datasheet Links / Attachment Status"]
+    datasheet_sections = ["## Extracted Datasheet Text / Link Status"]
+    remaining_chars = max(1000, int(DATASHEET_ANALYZER_MAX_TEXT_CHARS))
+    per_file_limit = max(1000, int(DATASHEET_ANALYZER_MAX_TEXT_CHARS_PER_FILE))
     for mpn, url in mpn_url_pairs:
         content, mime_type, error = download_datasheet_for_ai(url)
+        extracted_text = ""
+        extract_status = ""
         if content:
-            status = f"Downloaded metadata available ({mime_type}, {len(content)} bytes). Use the datasheet URL as the source reference."
+            extracted_text, extract_status = extract_datasheet_text(content, mime_type, url=url)
+            if extracted_text:
+                status = f"Downloaded and extracted datasheet text ({mime_type}, {len(content)} bytes, {len(extracted_text)} chars extracted)."
+                if remaining_chars > 0:
+                    snippet_limit = min(per_file_limit, remaining_chars)
+                    snippet = extracted_text[:snippet_limit]
+                    remaining_chars -= len(snippet)
+                    datasheet_sections.append(
+                        f"### Datasheet for MPN: {mpn}\n"
+                        f"Source URL: {url}\n"
+                        f"Extraction Status: {extract_status}\n"
+                        f"Extracted Text Start:\n```text\n{snippet}\n```"
+                    )
+                else:
+                    datasheet_sections.append(
+                        f"### Datasheet for MPN: {mpn}\n"
+                        f"Source URL: {url}\n"
+                        f"Extraction Status: {status} Datasheet text limit already reached before this file."
+                    )
+            else:
+                status = f"Downloaded ({mime_type}, {len(content)} bytes), but no local text was extracted: {extract_status}."
+                datasheet_sections.append(
+                    f"### Datasheet for MPN: {mpn}\n"
+                    f"Source URL: {url}\n"
+                    f"Extraction Status: {status}\n"
+                    "Extracted Text: Not available. Use distributor parametric fallback and mark missing datasheet values clearly."
+                )
         else:
-            status = f"Attachment unavailable: {error}. Use the URL/context if accessible; otherwise report Not found."
-        datasheet_lines.append(f"- MPN: {mpn}\n  Datasheet URL: {url or 'Not available'}\n  Status: {status}")
-        status_rows.append({"MPN": mpn, "Datasheet URL": url, "Status": status})
+            status = f"Attachment unavailable: {error}."
+            datasheet_sections.append(
+                f"### Datasheet for MPN: {mpn}\n"
+                f"Source URL: {url or 'Not available'}\n"
+                f"Extraction Status: {status}\n"
+                "Extracted Text: Not available. Use distributor parametric fallback and mark missing datasheet values clearly."
+            )
+        status_rows.append({
+            "MPN": mpn,
+            "Datasheet URL": url,
+            "Status": status,
+            "Extracted Characters": len(extracted_text),
+        })
+        if remaining_chars <= 0:
+            datasheet_sections.append("Datasheet text limit reached; later datasheet excerpts may be truncated and should rely on link/status plus parametric fallback.")
 
     user_content = "\n\n".join(
         [
             "\n".join(prompt_lines),
-            "\n".join(datasheet_lines),
+            "\n\n".join(datasheet_sections),
             str(parametric_context or "").strip(),
         ]
     ).strip()
