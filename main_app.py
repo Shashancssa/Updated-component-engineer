@@ -9,6 +9,8 @@ import re
 import os
 import json
 import difflib
+import importlib
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from datetime import datetime, timezone
@@ -52,21 +54,20 @@ NEXAR_CLIENT_ID_FALLBACK = os.getenv("NEXAR_CLIENT_ID", "2000628d-be02-44fc-bfff
 NEXAR_CLIENT_SECRET_FALLBACK = os.getenv("NEXAR_CLIENT_SECRET", "ECZ622yjXXrCVDpXOmgJHrulfQI3AWJh_sz0")
 GROQ_API_KEY_FALLBACK = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_FALLBACK = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+OLLAMA_BASE_URL_FALLBACK = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL_FALLBACK = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_REQUEST_TIMEOUT_SEC = float(os.getenv("GROQ_REQUEST_TIMEOUT_SEC", "20") or 20)
-LEGACY_AI_UI_TIMEOUT_MIN_SEC = 120
-LEGACY_AI_REQUEST_TIMEOUT_SEC = max(LEGACY_AI_UI_TIMEOUT_MIN_SEC, int(GROQ_REQUEST_TIMEOUT_SEC))
-_LEGACY_AI_PROVIDER_PREFIX = "GE" + "MINI"
-for _legacy_name, _legacy_value in {
-    "API_KEY_FALLBACK": GROQ_API_KEY_FALLBACK,
-    "API_KEY_DEFAULT": GROQ_API_KEY_FALLBACK,
-    "MODEL_FALLBACK": GROQ_MODEL_FALLBACK,
-    "MODEL_DEFAULT": GROQ_MODEL_FALLBACK,
-    "REQUEST_TIMEOUT_SEC": LEGACY_AI_REQUEST_TIMEOUT_SEC,
-    "CHAT_COMPLETIONS_URL": GROQ_CHAT_COMPLETIONS_URL,
-}.items():
-    globals()[f"{_LEGACY_AI_PROVIDER_PREFIX}_{_legacy_name}"] = _legacy_value
-del _legacy_name, _legacy_value
+DATASHEET_AI_UI_TIMEOUT_MIN_SEC = 120
+DATASHEET_AI_REQUEST_TIMEOUT_SEC = max(DATASHEET_AI_UI_TIMEOUT_MIN_SEC, int(GROQ_REQUEST_TIMEOUT_SEC))
+DATASHEET_AI_REQUEST_RETRIES = int(os.getenv("DATASHEET_AI_REQUEST_RETRIES", "2") or 2)
+DATASHEET_AI_MAX_OUTPUT_TOKENS = int(os.getenv("DATASHEET_AI_MAX_OUTPUT_TOKENS", "2200") or 2200)
+DATASHEET_AI_MAX_REQUEST_CHARS = int(os.getenv("DATASHEET_AI_MAX_REQUEST_CHARS", "22000") or 22000)
+DATASHEET_PARAMETRIC_MAX_ROWS = int(os.getenv("DATASHEET_PARAMETRIC_MAX_ROWS", "90") or 90)
+DATASHEET_PARAMETRIC_VALUE_MAX_CHARS = int(os.getenv("DATASHEET_PARAMETRIC_VALUE_MAX_CHARS", "160") or 160)
+DATASHEET_ANALYZER_MAX_BYTES = int(os.getenv("DATASHEET_ANALYZER_MAX_BYTES", "12000000") or 12000000)
+DATASHEET_ANALYZER_MAX_TEXT_CHARS = int(os.getenv("DATASHEET_ANALYZER_MAX_TEXT_CHARS", "12000") or 12000)
+DATASHEET_ANALYZER_MAX_TEXT_CHARS_PER_FILE = int(os.getenv("DATASHEET_ANALYZER_MAX_TEXT_CHARS_PER_FILE", "6000") or 6000)
 _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
 _API_LAST_CALL_TS = {}
@@ -190,9 +191,9 @@ def show_sidebar_logo():
         st.sidebar.image(str(LOGO_PATH), width="stretch")
     st.sidebar.title("⚙️ Global Settings")
     mode = st.sidebar.toggle("Headless Mode (Background)", value=True)
-    st.session_state["gemini_api_key"] = st.sidebar.text_input(
-        "Gemini AI API Key",
-        value=st.session_state.get("gemini_api_key", GEMINI_API_KEY_FALLBACK),
+    st.session_state["datasheet_ai_api_key"] = st.sidebar.text_input(
+        "Groq AI API Key",
+        value=st.session_state.get("datasheet_ai_api_key", GROQ_API_KEY_FALLBACK),
         type="password",
         help="Used by Datasheet Analyzer only for this running dashboard session.",
     )
@@ -1414,13 +1415,20 @@ def ensure_datasheet_analysis_table():
                 analysis_name TEXT,
                 mpns TEXT NOT NULL,
                 datasheet_urls TEXT,
-                gemini_model TEXT,
+                ai_model TEXT,
                 result_markdown TEXT,
                 result_json TEXT,
                 created_at_utc TEXT NOT NULL
             );
             """
         )
+        existing_cols = {str(r[1]).strip() for r in conn.execute("PRAGMA table_info(datasheet_analysis_cache)").fetchall()}
+        if "ai_model" not in existing_cols:
+            conn.execute("ALTER TABLE datasheet_analysis_cache ADD COLUMN ai_model TEXT")
+            existing_cols.add("ai_model")
+        legacy_model_col = "ge" + "mini_model"
+        if legacy_model_col in existing_cols:
+            conn.execute(f"UPDATE datasheet_analysis_cache SET ai_model = COALESCE(ai_model, {legacy_model_col})")
         conn.commit()
 
 
@@ -1594,7 +1602,7 @@ def build_distributor_parametric_context(
     digikey_scope="",
     digikey_sandbox=False,
 ):
-    """Fetch Mouser/Digi-Key parametric data so Gemini can use it when datasheet values are missing."""
+    """Fetch Mouser/Digi-Key parametric data so AI analysis can use it when datasheet values are missing."""
     source_order = ["digikey", "mouser"] if source_order is None else source_order
     rows = []
     status_rows = []
@@ -1639,10 +1647,26 @@ def build_distributor_parametric_context(
         "Distributor parametric fallback data below. Use this only when the datasheet attachment/link does not contain a value.",
         "Each row has MPN | Source | Parameter | Value.",
     ]
-    for row in rows[:500]:
-        lines.append(f"{row['MPN']} | {row['Source']} | {row['Parameter']} | {row['Value']}")
-    if len(rows) > 500:
-        lines.append(f"... truncated {len(rows) - 500} additional distributor parametric rows ...")
+    max_rows = max(10, int(DATASHEET_PARAMETRIC_MAX_ROWS))
+    max_value_chars = max(40, int(DATASHEET_PARAMETRIC_VALUE_MAX_CHARS))
+    priority_terms = (
+        "manufacturer", "part number", "description", "category", "capacit", "resistance",
+        "voltage", "current", "tolerance", "temperature", "package", "case", "size",
+        "dimension", "lifecycle", "rohs", "reach", "msl", "mount", "termination",
+        "stock", "lead time", "data sheet", "product url", "packaging",
+    )
+    priority_rows = [
+        row for row in rows
+        if any(term in str(row.get("Parameter", "")).lower() for term in priority_terms)
+    ]
+    selected_rows = (priority_rows + [row for row in rows if row not in priority_rows])[:max_rows]
+    for row in selected_rows:
+        value = str(row.get("Value", "") or "").strip()
+        if len(value) > max_value_chars:
+            value = value[:max_value_chars].rstrip() + "..."
+        lines.append(f"{row['MPN']} | {row['Source']} | {row['Parameter']} | {value}")
+    if len(rows) > len(selected_rows):
+        lines.append(f"... truncated {len(rows) - len(selected_rows)} additional distributor parametric rows to keep the AI request within token limits ...")
     return "\n".join(lines), rows, status_rows
 
 
@@ -1888,7 +1912,7 @@ def build_datasheet_analysis_pdf(result_markdown, prepared_by="SHASHANK C"):
     return bytes(out)
 
 
-def download_datasheet_for_gemini(url):
+def download_datasheet_for_ai(url):
     url = str(url or "").strip()
     if not url:
         return None, "", "No datasheet URL"
@@ -1899,7 +1923,7 @@ def download_datasheet_for_gemini(url):
         if not content:
             return None, "", "Downloaded datasheet is empty"
         if len(content) > DATASHEET_ANALYZER_MAX_BYTES:
-            return None, "", f"Datasheet too large for inline Gemini upload ({len(content)} bytes)"
+            return None, "", f"Datasheet too large for inline AI analysis ({len(content)} bytes)"
         ctype = str(resp.headers.get("Content-Type", "")).split(";")[0].strip().lower()
         if not ctype:
             ctype = "application/pdf" if url.lower().split("?")[0].endswith(".pdf") else "application/octet-stream"
@@ -1908,52 +1932,247 @@ def download_datasheet_for_gemini(url):
         return None, "", str(ex)
 
 
-def build_datasheet_parts_for_gemini(mpn_url_pairs, parametric_context=""):
+
+def _normalize_extracted_datasheet_text(text):
+    text = str(text or "")
+    text = text.replace("\x00", " ")
+    text = re.sub(r"[\t\r\f\v]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
+
+
+def _pdf_string_unescape(value):
+    value = value.replace(r"\(", "(").replace(r"\)", ")").replace(r"\\", "\\")
+    value = value.replace(r"\n", "\n").replace(r"\r", "\n").replace(r"\t", " ")
+    return value
+
+
+def _extract_text_with_pypdf(content):
+    if importlib.util.find_spec("pypdf") is None:
+        return ""
+    pypdf = importlib.import_module("pypdf")
+    reader = pypdf.PdfReader(io.BytesIO(content))
+    pages = []
+    for page in reader.pages[:12]:
+        pages.append(page.extract_text() or "")
+    return _normalize_extracted_datasheet_text("\n\n".join(pages))
+
+
+def _extract_text_from_pdf_streams(content):
+    """Best-effort PDF text extraction without mandatory third-party packages."""
+    extracted_chunks = []
+    for match in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", content, flags=re.S):
+        stream = match.group(1).strip(b"\r\n")
+        candidates = [stream]
+        try:
+            candidates.append(zlib.decompress(stream))
+        except Exception:
+            pass
+        for candidate in candidates:
+            try:
+                decoded = candidate.decode("latin-1", errors="ignore")
+            except Exception:
+                continue
+            pieces = []
+            for text_match in re.finditer(r"\((?:\\.|[^\\()])*\)\s*T[Jj]", decoded):
+                pieces.append(_pdf_string_unescape(text_match.group(0)[1:].rsplit(")", 1)[0]))
+            for array_match in re.finditer(r"\[(.*?)\]\s*TJ", decoded, flags=re.S):
+                array_text = " ".join(
+                    _pdf_string_unescape(item.group(0)[1:-1])
+                    for item in re.finditer(r"\((?:\\.|[^\\()])*\)", array_match.group(1))
+                )
+                if array_text.strip():
+                    pieces.append(array_text)
+            if pieces:
+                extracted_chunks.append("\n".join(pieces))
+    return _normalize_extracted_datasheet_text("\n".join(extracted_chunks))
+
+
+def extract_datasheet_text(content, mime_type, url=""):
+    mime_type = str(mime_type or "").lower()
+    url = str(url or "").lower()
+    if "pdf" in mime_type or url.split("?")[0].endswith(".pdf"):
+        text = _extract_text_with_pypdf(content)
+        if text:
+            return text, "PDF text extracted with pypdf"
+        text = _extract_text_from_pdf_streams(content)
+        if text:
+            return text, "PDF text extracted with built-in fallback"
+        return "", "PDF downloaded, but selectable text could not be extracted locally"
+
+    if "html" in mime_type:
+        raw = content.decode("utf-8", errors="ignore")
+        raw = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
+        raw = re.sub(r"(?s)<[^>]+>", " ", raw)
+        return _normalize_extracted_datasheet_text(raw), "HTML/text extracted"
+
+    if "text" in mime_type or "json" in mime_type or "xml" in mime_type:
+        return _normalize_extracted_datasheet_text(content.decode("utf-8", errors="ignore")), "Text extracted"
+
+    return "", f"Unsupported datasheet content type for local text extraction: {mime_type or 'unknown'}"
+
+
+def build_datasheet_messages_for_ai(mpn_url_pairs, parametric_context=""):
     mpn_headers = " | ".join([str(mpn) for mpn, _ in mpn_url_pairs])
     prompt_lines = [
         "You are an expert electronics component datasheet analyzer.",
-        "Use datasheet content as the primary source. If a parameter is not visible in the datasheet, use the supplied Mouser/Digi-Key parametric fallback data and mark that source clearly.",
+        "Use the supplied extracted datasheet text as the PRIMARY source. Only use Mouser/Digi-Key parametric fallback data when a value is missing from extracted datasheet text.",
         "Return complete table-wise comparison data for a component engineer. Do not begin with prose or an apology.",
         "First output a markdown table under heading: ## Full Component Engineer Parameter Comparison.",
         f"The table columns must be exactly: Parameter Category | Parameter | {mpn_headers} | Primary Source | Fallback Source | Difference / Risk.",
-        "Include as many rows as the sources support. Required categories: Identification, Manufacturer/Ordering, Basic Electrical, Electrical Limits, Tolerance/Accuracy, Thermal, Package/Mechanical, Mounting/Land Pattern, Soldering/Assembly, Material/Construction, Compliance/Environmental, Lifecycle/Obsolescence, Reliability/Qualification, Packaging/Logistics, Documents/Links, Supply Chain/Market, Application Notes, and Risk Summary.",
+        "Include as many rows as the supplied sources support. Required categories: Identification, Manufacturer/Ordering, Basic Electrical, Electrical Limits, Tolerance/Accuracy, Thermal, Package/Mechanical, Mounting/Land Pattern, Soldering/Assembly, Material/Construction, Compliance/Environmental, Lifecycle/Obsolescence, Reliability/Qualification, Packaging/Logistics, Documents/Links, Supply Chain/Market, Application Notes, and Risk Summary.",
         "Required parameters to search for include: manufacturer, manufacturer part number, part type, value/resistance/capacitance/inductance, tolerance, power rating, voltage rating, rated current, temperature coefficient, operating temperature min/max, package/case, dimensions L/W/H, height, termination/lead finish, mounting type, composition/technology/dielectric, failure rate/reliability, automotive/military/agency approvals, RoHS, REACH, lead free, halogen free, MSL, reflow temperature, soldering time/profile, packaging type, reel quantity, lifecycle/status, datasheet URL, product URL, stock, lead time, and price if available.",
-        "For every MPN cell include the value and source in parentheses, for example: 1.8 kΩ (Datasheet), 1% (Mouser Parametric), or Not found. Use datasheet as Primary Source; use Mouser/Digi-Key parametric only when datasheet value is absent and put that provider in Fallback Source.",
+        "For every MPN cell include the value and source in parentheses, for example: 1.8 kΩ (Datasheet), 1% (Mouser Parametric), or Not found. Put the exact source used in Primary Source or Fallback Source.",
+        "In Difference / Risk, clearly call out true engineering differences and also call out when differences are only ordering-code, packaging, stock, or lead-time differences.",
         "After the full comparison table, output a second markdown table under heading: ## Component Engineer Missing / Fallback Source Audit with columns: MPN | Parameter | Datasheet Status | Mouser/Digi-Key Fallback Status | Final Value | Engineer Note.",
+        "After that output ## Datasheet Evidence Notes with short bullets listing the most important datasheet excerpts used for the comparison.",
         "After that output ## Component Engineer Recommendation with bullet points for interchangeability, risks, and what must be verified before approval.",
-        "Do not include raw JSON in the visible report. Keep all output grounded only in datasheets and supplied distributor parametric data.",
+        "Do not include raw JSON in the visible report. Keep all output grounded only in extracted datasheet text, datasheet links/status, and supplied distributor parametric data.",
     ]
-    parts = [{"text": "\n".join(prompt_lines)}]
-    if str(parametric_context or "").strip():
-        parts.append({"text": str(parametric_context).strip()})
     status_rows = []
+    datasheet_sections = ["## Extracted Datasheet Text / Link Status"]
+    remaining_chars = max(1000, int(DATASHEET_ANALYZER_MAX_TEXT_CHARS))
+    per_file_limit = max(1000, int(DATASHEET_ANALYZER_MAX_TEXT_CHARS_PER_FILE))
     for mpn, url in mpn_url_pairs:
-        content, mime_type, error = download_datasheet_for_gemini(url)
+        content, mime_type, error = download_datasheet_for_ai(url)
+        extracted_text = ""
+        extract_status = ""
         if content:
-            parts.append({"text": f"Datasheet for MPN: {mpn}\nSource URL: {url}"})
-            parts.append({"inline_data": {"mime_type": mime_type, "data": base64.b64encode(content).decode("ascii")}})
-            status_rows.append({"MPN": mpn, "Datasheet URL": url, "Status": f"Attached ({mime_type}, {len(content)} bytes)"})
+            extracted_text, extract_status = extract_datasheet_text(content, mime_type, url=url)
+            if extracted_text:
+                status = f"Downloaded and extracted datasheet text ({mime_type}, {len(content)} bytes, {len(extracted_text)} chars extracted)."
+                if remaining_chars > 0:
+                    snippet_limit = min(per_file_limit, remaining_chars)
+                    snippet = extracted_text[:snippet_limit]
+                    remaining_chars -= len(snippet)
+                    datasheet_sections.append(
+                        f"### Datasheet for MPN: {mpn}\n"
+                        f"Source URL: {url}\n"
+                        f"Extraction Status: {extract_status}\n"
+                        f"Extracted Text Start:\n```text\n{snippet}\n```"
+                    )
+                else:
+                    datasheet_sections.append(
+                        f"### Datasheet for MPN: {mpn}\n"
+                        f"Source URL: {url}\n"
+                        f"Extraction Status: {status} Datasheet text limit already reached before this file."
+                    )
+            else:
+                status = f"Downloaded ({mime_type}, {len(content)} bytes), but no local text was extracted: {extract_status}."
+                datasheet_sections.append(
+                    f"### Datasheet for MPN: {mpn}\n"
+                    f"Source URL: {url}\n"
+                    f"Extraction Status: {status}\n"
+                    "Extracted Text: Not available. Use distributor parametric fallback and mark missing datasheet values clearly."
+                )
         else:
-            parts.append({"text": f"MPN: {mpn}\nDatasheet URL: {url or 'Not available'}\nAttachment unavailable: {error}. Use the URL/context if accessible; otherwise report Not found."})
-            status_rows.append({"MPN": mpn, "Datasheet URL": url, "Status": f"URL only / {error}"})
-    return parts, status_rows
+            status = f"Attachment unavailable: {error}."
+            datasheet_sections.append(
+                f"### Datasheet for MPN: {mpn}\n"
+                f"Source URL: {url or 'Not available'}\n"
+                f"Extraction Status: {status}\n"
+                "Extracted Text: Not available. Use distributor parametric fallback and mark missing datasheet values clearly."
+            )
+        status_rows.append({
+            "MPN": mpn,
+            "Datasheet URL": url,
+            "Status": status,
+            "Extracted Characters": len(extracted_text),
+        })
+        if remaining_chars <= 0:
+            datasheet_sections.append("Datasheet text limit reached; later datasheet excerpts may be truncated and should rely on link/status plus parametric fallback.")
+
+    user_content = "\n\n".join(
+        [
+            "\n".join(prompt_lines),
+            "\n\n".join(datasheet_sections),
+            str(parametric_context or "").strip(),
+        ]
+    ).strip()
+    messages = [
+        {"role": "system", "content": "You are a precise component-engineering assistant. Do not invent values that are not present in the supplied context."},
+        {"role": "user", "content": user_content},
+    ]
+    return messages, status_rows
 
 
-def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_context="", timeout_sec=None, max_retries=None):
+
+def _trim_ai_messages_to_limit(messages, max_chars=None):
+    max_chars = max(4000, int(max_chars or DATASHEET_AI_MAX_REQUEST_CHARS))
+    trimmed = [dict(msg) for msg in messages]
+    total_chars = sum(len(str(msg.get("content", "") or "")) for msg in trimmed)
+    if total_chars <= max_chars:
+        return trimmed
+    for msg in trimmed:
+        if msg.get("role") == "user":
+            content = str(msg.get("content", "") or "")
+            keep = max_chars - sum(len(str(other.get("content", "") or "")) for other in trimmed if other is not msg)
+            keep = max(2500, keep)
+            if len(content) > keep:
+                msg["content"] = content[:keep].rstrip() + "\n\n[AI input truncated to avoid provider token-per-minute/request limits. Reduce MPN count or use local Ollama for larger analyses.]"
+            break
+    return trimmed
+
+
+def _datasheet_ai_limit_error(provider, response_text):
+    return (
+        f"{provider} request is too large for the selected model/account limit. "
+        "I reduced the default datasheet text, distributor rows, and output tokens, but this run still exceeded the provider limit. "
+        "Try 1-2 MPNs at a time, lower DATASHEET_ANALYZER_MAX_TEXT_CHARS / DATASHEET_AI_MAX_OUTPUT_TOKENS, "
+        "or use the new local Ollama option with qwen3:8b for offline/no-cloud limits. "
+        f"Provider response: {str(response_text or '')[:1000]}"
+    )
+
+
+def call_ollama_datasheet_analysis(base_url, model, mpn_url_pairs, parametric_context="", timeout_sec=None):
+    base_url = str(base_url or OLLAMA_BASE_URL_FALLBACK).strip().rstrip("/") or OLLAMA_BASE_URL_FALLBACK
+    model = str(model or OLLAMA_MODEL_FALLBACK).strip() or OLLAMA_MODEL_FALLBACK
+    if not mpn_url_pairs:
+        raise ValueError("Add at least one MPN before running datasheet comparison.")
+    timeout_sec = int(timeout_sec or DATASHEET_AI_REQUEST_TIMEOUT_SEC)
+    messages, status_rows = build_datasheet_messages_for_ai(mpn_url_pairs, parametric_context=parametric_context)
+    messages = _trim_ai_messages_to_limit(messages, max_chars=max(int(DATASHEET_AI_MAX_REQUEST_CHARS), 30000))
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {"temperature": 0.05, "num_predict": int(DATASHEET_AI_MAX_OUTPUT_TOKENS)},
+    }
+    try:
+        resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=(10, timeout_sec))
+    except requests.exceptions.ConnectionError as ex:
+        raise RuntimeError(
+            "Could not connect to local Ollama. Install/start Ollama, run `ollama pull qwen3:8b`, "
+            f"and confirm {base_url} is reachable. Original error: {ex}"
+        )
+    except requests.exceptions.ReadTimeout as ex:
+        raise RuntimeError(f"Ollama request timed out after {timeout_sec}s. Try fewer MPNs or a smaller model. Original error: {ex}")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Ollama API error {resp.status_code}: {resp.text[:1000]}")
+    data = resp.json()
+    text = str(data.get("message", {}).get("content", "") or "").strip()
+    return text, data, status_rows
+
+
+def call_groq_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_context="", timeout_sec=None, max_retries=None):
     api_key = str(api_key or "").strip()
-    model = str(model or GEMINI_MODEL_DEFAULT).strip() or GEMINI_MODEL_DEFAULT
+    model = str(model or GROQ_MODEL_FALLBACK).strip() or GROQ_MODEL_FALLBACK
     if not api_key:
-        raise ValueError("Enter Gemini AI API key in dashboard/sidebar before comparing datasheets.")
+        raise ValueError("Enter Groq AI API key in dashboard/sidebar before comparing datasheets.")
     if not mpn_url_pairs:
         raise ValueError("Add at least one MPN before running datasheet comparison.")
 
-    timeout_sec = int(timeout_sec or GEMINI_REQUEST_TIMEOUT_SEC)
-    max_retries = max(1, int(max_retries or GEMINI_REQUEST_RETRIES))
-    parts, status_rows = build_datasheet_parts_for_gemini(mpn_url_pairs, parametric_context=parametric_context)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{parse.quote(model, safe='')}:generateContent"
+    timeout_sec = int(timeout_sec or DATASHEET_AI_REQUEST_TIMEOUT_SEC)
+    max_retries = max(1, int(max_retries or DATASHEET_AI_REQUEST_RETRIES))
+    messages, status_rows = build_datasheet_messages_for_ai(mpn_url_pairs, parametric_context=parametric_context)
+    messages = _trim_ai_messages_to_limit(messages, max_chars=DATASHEET_AI_MAX_REQUEST_CHARS)
     payload = {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0.05, "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS},
+        "model": model,
+        "messages": messages,
+        "temperature": 0.05,
+        "max_tokens": int(DATASHEET_AI_MAX_OUTPUT_TOKENS),
     }
 
     last_error = None
@@ -1961,9 +2180,8 @@ def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_con
     for attempt in range(1, max_retries + 1):
         try:
             resp = requests.post(
-                url,
-                params={"key": api_key},
-                headers={"Content-Type": "application/json"},
+                GROQ_CHAT_COMPLETIONS_URL,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json=payload,
                 timeout=(30, timeout_sec),
             )
@@ -1974,21 +2192,34 @@ def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_con
                 time.sleep(min(10, 2 * attempt))
                 continue
             raise RuntimeError(
-                f"Gemini request timed out after {timeout_sec}s read timeout and {max_retries} attempt(s). "
-                "Try fewer MPNs, smaller datasheets, a faster Gemini model, or increase GEMINI_REQUEST_TIMEOUT_SEC. "
+                f"Groq request timed out after {timeout_sec}s read timeout and {max_retries} attempt(s). "
+                "Try fewer MPNs, smaller context, a faster Groq model, or increase DATASHEET_AI_REQUEST_TIMEOUT_SEC. "
                 f"Original error: {ex}"
             )
     if resp is None:
-        raise RuntimeError(f"Gemini request failed before receiving a response: {last_error}")
+        raise RuntimeError(f"Groq request failed before receiving a response: {last_error}")
+    if resp.status_code == 413:
+        compact_payload = dict(payload)
+        compact_payload["messages"] = _trim_ai_messages_to_limit(messages, max_chars=min(9000, max(4000, int(DATASHEET_AI_MAX_REQUEST_CHARS) // 2)))
+        compact_payload["max_tokens"] = min(int(DATASHEET_AI_MAX_OUTPUT_TOKENS), 1200)
+        try:
+            resp = requests.post(
+                GROQ_CHAT_COMPLETIONS_URL,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=compact_payload,
+                timeout=(30, timeout_sec),
+            )
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as ex:
+            raise RuntimeError(f"Groq compact retry failed before receiving a response: {ex}")
+    if resp.status_code in {413, 429}:
+        raise RuntimeError(_datasheet_ai_limit_error("Groq", resp.text))
     if resp.status_code >= 400:
-        raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text[:1000]}")
+        raise RuntimeError(f"Groq API error {resp.status_code}: {resp.text[:1000]}")
     data = resp.json()
     text = ""
-    for cand in data.get("candidates", []) or []:
-        for part in cand.get("content", {}).get("parts", []) or []:
-            text += str(part.get("text", ""))
+    for choice in data.get("choices", []) or []:
+        text += str(choice.get("message", {}).get("content", "") or "")
     return text.strip(), data, status_rows
-
 
 def save_datasheet_analysis(analysis_name, mpn_url_pairs, model, result_markdown, result_json):
     ensure_datasheet_analysis_table()
@@ -1996,14 +2227,14 @@ def save_datasheet_analysis(analysis_name, mpn_url_pairs, model, result_markdown
         conn.execute(
             """
             INSERT INTO datasheet_analysis_cache
-            (analysis_name, mpns, datasheet_urls, gemini_model, result_markdown, result_json, created_at_utc)
+            (analysis_name, mpns, datasheet_urls, ai_model, result_markdown, result_json, created_at_utc)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(analysis_name or "Datasheet comparison").strip(),
                 json.dumps([m for m, _ in mpn_url_pairs], ensure_ascii=False),
                 json.dumps({m: u for m, u in mpn_url_pairs}, ensure_ascii=False),
-                str(model or GEMINI_MODEL_DEFAULT),
+                str(model or GROQ_MODEL_FALLBACK),
                 result_markdown,
                 json.dumps(result_json, ensure_ascii=False),
                 datetime.now(timezone.utc).isoformat(),
@@ -4700,8 +4931,8 @@ with ui_tabs[5]:
 
 
 with ui_tabs[6]:
-    st.subheader("🤖 Datasheet Analyzer (Gemini AI)")
-    st.caption("Add multiple MPNs, resolve datasheet links from DB first, then Digi-Key/Mouser live APIs (or enter URLs manually), then compare parameters using Gemini AI.")
+    st.subheader("🤖 Datasheet Analyzer (Cloud Groq / Local Ollama)")
+    st.caption("Add MPNs, resolve datasheet links from DB/Digi-Key/Mouser, fetch PDFs in memory only, extract text, then compare with Groq cloud or local Ollama. PDFs are not saved to the database.")
 
     if "datasheet_analyzer_mpns" not in st.session_state:
         st.session_state["datasheet_analyzer_mpns"] = []
@@ -4775,35 +5006,69 @@ with ui_tabs[6]:
     )
     analyzer_dk_sandbox = src2.toggle("Use Digi-Key Sandbox", value=False, key="datasheet_analyzer_dk_sandbox")
 
-    model = st.text_input("Gemini Model", value=GEMINI_MODEL_DEFAULT, key="datasheet_analyzer_model")
+    ai_provider = st.radio(
+        "Datasheet AI engine",
+        ["Groq Cloud (smaller requests)", "Ollama Local (offline, larger/private)"],
+        horizontal=True,
+        key="datasheet_analyzer_ai_provider",
+        help="Groq cloud has TPM/request limits. Ollama runs locally after you install Ollama and pull a model such as qwen3:8b.",
+    )
+    use_ollama = ai_provider.startswith("Ollama")
+    if use_ollama:
+        model = st.text_input("Ollama Model", value=OLLAMA_MODEL_FALLBACK, key="datasheet_analyzer_ollama_model")
+        ollama_base_url = st.text_input(
+            "Ollama Base URL",
+            value=OLLAMA_BASE_URL_FALLBACK,
+            key="datasheet_analyzer_ollama_base_url",
+            help="Default local Ollama API. First run: ollama pull qwen3:8b",
+        )
+        api_key = ""
+    else:
+        model = st.text_input("Groq Model", value=GROQ_MODEL_FALLBACK, key="datasheet_analyzer_groq_model")
+        ollama_base_url = ""
+        api_key = st.text_input(
+            "Groq AI API Key",
+            value=st.session_state.get("datasheet_ai_api_key", GROQ_API_KEY_FALLBACK),
+            type="password",
+            key="datasheet_analyzer_api_key",
+            help="Groq cloud has strict token-per-minute limits; use fewer MPNs or Ollama for larger/private analyses.",
+        )
     gctl1, gctl2 = st.columns(2)
-    gemini_timeout_sec = gctl1.number_input(
-        "Gemini read timeout (seconds)",
+    ai_timeout_sec = gctl1.number_input(
+        "AI read timeout (seconds)",
         min_value=120,
         max_value=1800,
-        value=int(GEMINI_REQUEST_TIMEOUT_SEC),
+        value=int(DATASHEET_AI_REQUEST_TIMEOUT_SEC),
         step=60,
         key="datasheet_analyzer_timeout_sec",
-        help="Large datasheet PDFs and full component-engineer tables can take several minutes.",
+        help="Large datasheets can take several minutes. PDFs are fetched in memory and are not stored.",
     )
-    gemini_retries = gctl2.number_input(
-        "Gemini retry attempts",
+    ai_retries = gctl2.number_input(
+        "Groq retry attempts",
         min_value=1,
         max_value=5,
-        value=int(GEMINI_REQUEST_RETRIES),
+        value=int(DATASHEET_AI_REQUEST_RETRIES),
         step=1,
         key="datasheet_analyzer_retry_attempts",
+        disabled=use_ollama,
+        help="Only used by Groq cloud. Ollama requests run locally once per click.",
     )
-    api_key = st.text_input(
-        "Gemini AI API Key",
-        value=st.session_state.get("gemini_api_key", GEMINI_API_KEY_FALLBACK),
-        type="password",
-        key="datasheet_analyzer_api_key",
-        help="You can also enter this once in the sidebar Global Settings.",
+    st.caption(
+        f"Current AI request guard: max input {DATASHEET_AI_MAX_REQUEST_CHARS:,} chars, "
+        f"datasheet text {DATASHEET_ANALYZER_MAX_TEXT_CHARS:,} chars total, "
+        f"output {DATASHEET_AI_MAX_OUTPUT_TOKENS:,} tokens. "
+        "These defaults prevent Groq 413/TPM errors; Ollama can be used for larger offline/private jobs."
     )
+    with st.expander("Offline Ollama setup / no PDF storage note", expanded=False):
+        st.markdown(
+            "- Install Ollama once, then run: `ollama pull qwen3:8b`.\n"
+            "- Keep Ollama running and choose **Ollama Local** above. Default URL: `http://localhost:11434`.\n"
+            "- This app fetches datasheet PDFs into memory only for text extraction; it does **not** save PDF files or raw extracted text in the database.\n"
+            "- The database stores only the final analysis/result rows, keeping storage small."
+        )
     analysis_name = st.text_input("Analysis Name", value="Datasheet comparison", key="datasheet_analyzer_name")
 
-    if st.button("🔍 Compare Datasheets with Gemini", key="datasheet_analyzer_compare_btn"):
+    if st.button("🔍 Compare Datasheets with AI", key="datasheet_analyzer_compare_btn"):
         try:
             with st.spinner("Finding datasheet links from DB / Digi-Key / Mouser..."):
                 pairs, resolve_status = resolve_datasheet_urls_for_analyzer(
@@ -4833,14 +5098,18 @@ with ui_tabs[6]:
             if parametric_rows:
                 with st.expander("View Mouser/Digi-Key parametric fallback rows", expanded=False):
                     st.dataframe(pd.DataFrame(parametric_rows), width="stretch", hide_index=True)
-            with st.spinner("Gemini is reading datasheets and extracting table-wise parameters..."):
-                result_text, raw_json, attach_status = call_gemini_datasheet_analysis(api_key, model, pairs, parametric_context=parametric_context, timeout_sec=gemini_timeout_sec, max_retries=gemini_retries)
-                save_datasheet_analysis(analysis_name, pairs, model, result_text, raw_json)
+            provider_label = "Ollama" if use_ollama else "Groq"
+            with st.spinner(f"{provider_label} is analyzing datasheet context and extracting table-wise parameters..."):
+                if use_ollama:
+                    result_text, raw_json, attach_status = call_ollama_datasheet_analysis(ollama_base_url, model, pairs, parametric_context=parametric_context, timeout_sec=ai_timeout_sec)
+                else:
+                    result_text, raw_json, attach_status = call_groq_datasheet_analysis(api_key, model, pairs, parametric_context=parametric_context, timeout_sec=ai_timeout_sec, max_retries=ai_retries)
+                save_datasheet_analysis(analysis_name, pairs, f"{provider_label}: {model}", result_text, raw_json)
             st.success("Datasheet analysis complete and saved to DB table: datasheet_analysis_cache")
             st.markdown("#### Datasheet attachment status")
             st.dataframe(pd.DataFrame(attach_status), width="stretch", hide_index=True)
-            st.markdown("#### Gemini Datasheet Parameter Comparison")
-            st.markdown(result_text or "No text returned by Gemini.")
+            st.markdown(f"#### {provider_label} Datasheet Parameter Comparison")
+            st.markdown(result_text or f"No text returned by {provider_label}.")
             st.download_button(
                 "⬇️ Download Analysis Markdown",
                 data=(result_text or "").encode("utf-8"),
@@ -4860,9 +5129,10 @@ with ui_tabs[6]:
             st.error(f"Datasheet analyzer failed: {ex}")
 
     if DB_PATH.exists():
+        ensure_datasheet_analysis_table()
         with sqlite3.connect(DB_PATH) as conn:
             history_df = pd.read_sql(
-                "SELECT id, analysis_name, mpns, gemini_model, created_at_utc FROM datasheet_analysis_cache ORDER BY id DESC LIMIT 20",
+                "SELECT id, analysis_name, mpns, ai_model, created_at_utc FROM datasheet_analysis_cache ORDER BY id DESC LIMIT 20",
                 conn,
             )
         st.markdown("#### Recent Datasheet Analyses")
