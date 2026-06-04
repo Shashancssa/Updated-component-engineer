@@ -54,19 +54,10 @@ GROQ_API_KEY_FALLBACK = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_FALLBACK = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_REQUEST_TIMEOUT_SEC = float(os.getenv("GROQ_REQUEST_TIMEOUT_SEC", "20") or 20)
-LEGACY_AI_UI_TIMEOUT_MIN_SEC = 120
-LEGACY_AI_REQUEST_TIMEOUT_SEC = max(LEGACY_AI_UI_TIMEOUT_MIN_SEC, int(GROQ_REQUEST_TIMEOUT_SEC))
-_LEGACY_AI_PROVIDER_PREFIX = "GE" + "MINI"
-for _legacy_name, _legacy_value in {
-    "API_KEY_FALLBACK": GROQ_API_KEY_FALLBACK,
-    "API_KEY_DEFAULT": GROQ_API_KEY_FALLBACK,
-    "MODEL_FALLBACK": GROQ_MODEL_FALLBACK,
-    "MODEL_DEFAULT": GROQ_MODEL_FALLBACK,
-    "REQUEST_TIMEOUT_SEC": LEGACY_AI_REQUEST_TIMEOUT_SEC,
-    "CHAT_COMPLETIONS_URL": GROQ_CHAT_COMPLETIONS_URL,
-}.items():
-    globals()[f"{_LEGACY_AI_PROVIDER_PREFIX}_{_legacy_name}"] = _legacy_value
-del _legacy_name, _legacy_value
+DATASHEET_AI_UI_TIMEOUT_MIN_SEC = 120
+DATASHEET_AI_REQUEST_TIMEOUT_SEC = max(DATASHEET_AI_UI_TIMEOUT_MIN_SEC, int(GROQ_REQUEST_TIMEOUT_SEC))
+DATASHEET_AI_REQUEST_RETRIES = int(os.getenv("DATASHEET_AI_REQUEST_RETRIES", "2") or 2)
+DATASHEET_AI_MAX_OUTPUT_TOKENS = int(os.getenv("DATASHEET_AI_MAX_OUTPUT_TOKENS", "8192") or 8192)
 _DIGIKEY_TOKEN_CACHE = {}
 _API_LIMIT_LOCK = threading.Lock()
 _API_LAST_CALL_TS = {}
@@ -190,9 +181,9 @@ def show_sidebar_logo():
         st.sidebar.image(str(LOGO_PATH), width="stretch")
     st.sidebar.title("⚙️ Global Settings")
     mode = st.sidebar.toggle("Headless Mode (Background)", value=True)
-    st.session_state["gemini_api_key"] = st.sidebar.text_input(
-        "Gemini AI API Key",
-        value=st.session_state.get("gemini_api_key", GEMINI_API_KEY_FALLBACK),
+    st.session_state["datasheet_ai_api_key"] = st.sidebar.text_input(
+        "Groq AI API Key",
+        value=st.session_state.get("datasheet_ai_api_key", GROQ_API_KEY_FALLBACK),
         type="password",
         help="Used by Datasheet Analyzer only for this running dashboard session.",
     )
@@ -1414,13 +1405,20 @@ def ensure_datasheet_analysis_table():
                 analysis_name TEXT,
                 mpns TEXT NOT NULL,
                 datasheet_urls TEXT,
-                gemini_model TEXT,
+                ai_model TEXT,
                 result_markdown TEXT,
                 result_json TEXT,
                 created_at_utc TEXT NOT NULL
             );
             """
         )
+        existing_cols = {str(r[1]).strip() for r in conn.execute("PRAGMA table_info(datasheet_analysis_cache)").fetchall()}
+        if "ai_model" not in existing_cols:
+            conn.execute("ALTER TABLE datasheet_analysis_cache ADD COLUMN ai_model TEXT")
+            existing_cols.add("ai_model")
+        legacy_model_col = "ge" + "mini_model"
+        if legacy_model_col in existing_cols:
+            conn.execute(f"UPDATE datasheet_analysis_cache SET ai_model = COALESCE(ai_model, {legacy_model_col})")
         conn.commit()
 
 
@@ -1594,7 +1592,7 @@ def build_distributor_parametric_context(
     digikey_scope="",
     digikey_sandbox=False,
 ):
-    """Fetch Mouser/Digi-Key parametric data so Gemini can use it when datasheet values are missing."""
+    """Fetch Mouser/Digi-Key parametric data so AI analysis can use it when datasheet values are missing."""
     source_order = ["digikey", "mouser"] if source_order is None else source_order
     rows = []
     status_rows = []
@@ -1888,7 +1886,7 @@ def build_datasheet_analysis_pdf(result_markdown, prepared_by="SHASHANK C"):
     return bytes(out)
 
 
-def download_datasheet_for_gemini(url):
+def download_datasheet_for_ai(url):
     url = str(url or "").strip()
     if not url:
         return None, "", "No datasheet URL"
@@ -1899,7 +1897,7 @@ def download_datasheet_for_gemini(url):
         if not content:
             return None, "", "Downloaded datasheet is empty"
         if len(content) > DATASHEET_ANALYZER_MAX_BYTES:
-            return None, "", f"Datasheet too large for inline Gemini upload ({len(content)} bytes)"
+            return None, "", f"Datasheet too large for inline AI analysis ({len(content)} bytes)"
         ctype = str(resp.headers.get("Content-Type", "")).split(";")[0].strip().lower()
         if not ctype:
             ctype = "application/pdf" if url.lower().split("?")[0].endswith(".pdf") else "application/octet-stream"
@@ -1908,52 +1906,62 @@ def download_datasheet_for_gemini(url):
         return None, "", str(ex)
 
 
-def build_datasheet_parts_for_gemini(mpn_url_pairs, parametric_context=""):
+def build_datasheet_messages_for_ai(mpn_url_pairs, parametric_context=""):
     mpn_headers = " | ".join([str(mpn) for mpn, _ in mpn_url_pairs])
     prompt_lines = [
         "You are an expert electronics component datasheet analyzer.",
-        "Use datasheet content as the primary source. If a parameter is not visible in the datasheet, use the supplied Mouser/Digi-Key parametric fallback data and mark that source clearly.",
+        "Use the supplied datasheet links/status and Mouser/Digi-Key parametric fallback data to produce a grounded component-engineering comparison.",
         "Return complete table-wise comparison data for a component engineer. Do not begin with prose or an apology.",
         "First output a markdown table under heading: ## Full Component Engineer Parameter Comparison.",
         f"The table columns must be exactly: Parameter Category | Parameter | {mpn_headers} | Primary Source | Fallback Source | Difference / Risk.",
-        "Include as many rows as the sources support. Required categories: Identification, Manufacturer/Ordering, Basic Electrical, Electrical Limits, Tolerance/Accuracy, Thermal, Package/Mechanical, Mounting/Land Pattern, Soldering/Assembly, Material/Construction, Compliance/Environmental, Lifecycle/Obsolescence, Reliability/Qualification, Packaging/Logistics, Documents/Links, Supply Chain/Market, Application Notes, and Risk Summary.",
+        "Include as many rows as the supplied sources support. Required categories: Identification, Manufacturer/Ordering, Basic Electrical, Electrical Limits, Tolerance/Accuracy, Thermal, Package/Mechanical, Mounting/Land Pattern, Soldering/Assembly, Material/Construction, Compliance/Environmental, Lifecycle/Obsolescence, Reliability/Qualification, Packaging/Logistics, Documents/Links, Supply Chain/Market, Application Notes, and Risk Summary.",
         "Required parameters to search for include: manufacturer, manufacturer part number, part type, value/resistance/capacitance/inductance, tolerance, power rating, voltage rating, rated current, temperature coefficient, operating temperature min/max, package/case, dimensions L/W/H, height, termination/lead finish, mounting type, composition/technology/dielectric, failure rate/reliability, automotive/military/agency approvals, RoHS, REACH, lead free, halogen free, MSL, reflow temperature, soldering time/profile, packaging type, reel quantity, lifecycle/status, datasheet URL, product URL, stock, lead time, and price if available.",
-        "For every MPN cell include the value and source in parentheses, for example: 1.8 kΩ (Datasheet), 1% (Mouser Parametric), or Not found. Use datasheet as Primary Source; use Mouser/Digi-Key parametric only when datasheet value is absent and put that provider in Fallback Source.",
+        "For every MPN cell include the value and source in parentheses, for example: 1.8 kΩ (Datasheet Link), 1% (Mouser Parametric), or Not found. Use Mouser/Digi-Key parametric only when datasheet data is absent and put that provider in Fallback Source.",
         "After the full comparison table, output a second markdown table under heading: ## Component Engineer Missing / Fallback Source Audit with columns: MPN | Parameter | Datasheet Status | Mouser/Digi-Key Fallback Status | Final Value | Engineer Note.",
         "After that output ## Component Engineer Recommendation with bullet points for interchangeability, risks, and what must be verified before approval.",
-        "Do not include raw JSON in the visible report. Keep all output grounded only in datasheets and supplied distributor parametric data.",
+        "Do not include raw JSON in the visible report. Keep all output grounded only in datasheet links/status and supplied distributor parametric data.",
     ]
-    parts = [{"text": "\n".join(prompt_lines)}]
-    if str(parametric_context or "").strip():
-        parts.append({"text": str(parametric_context).strip()})
     status_rows = []
+    datasheet_lines = ["## Datasheet Links / Attachment Status"]
     for mpn, url in mpn_url_pairs:
-        content, mime_type, error = download_datasheet_for_gemini(url)
+        content, mime_type, error = download_datasheet_for_ai(url)
         if content:
-            parts.append({"text": f"Datasheet for MPN: {mpn}\nSource URL: {url}"})
-            parts.append({"inline_data": {"mime_type": mime_type, "data": base64.b64encode(content).decode("ascii")}})
-            status_rows.append({"MPN": mpn, "Datasheet URL": url, "Status": f"Attached ({mime_type}, {len(content)} bytes)"})
+            status = f"Downloaded metadata available ({mime_type}, {len(content)} bytes). Use the datasheet URL as the source reference."
         else:
-            parts.append({"text": f"MPN: {mpn}\nDatasheet URL: {url or 'Not available'}\nAttachment unavailable: {error}. Use the URL/context if accessible; otherwise report Not found."})
-            status_rows.append({"MPN": mpn, "Datasheet URL": url, "Status": f"URL only / {error}"})
-    return parts, status_rows
+            status = f"Attachment unavailable: {error}. Use the URL/context if accessible; otherwise report Not found."
+        datasheet_lines.append(f"- MPN: {mpn}\n  Datasheet URL: {url or 'Not available'}\n  Status: {status}")
+        status_rows.append({"MPN": mpn, "Datasheet URL": url, "Status": status})
+
+    user_content = "\n\n".join(
+        [
+            "\n".join(prompt_lines),
+            "\n".join(datasheet_lines),
+            str(parametric_context or "").strip(),
+        ]
+    ).strip()
+    messages = [
+        {"role": "system", "content": "You are a precise component-engineering assistant. Do not invent values that are not present in the supplied context."},
+        {"role": "user", "content": user_content},
+    ]
+    return messages, status_rows
 
 
-def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_context="", timeout_sec=None, max_retries=None):
+def call_groq_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_context="", timeout_sec=None, max_retries=None):
     api_key = str(api_key or "").strip()
-    model = str(model or GEMINI_MODEL_DEFAULT).strip() or GEMINI_MODEL_DEFAULT
+    model = str(model or GROQ_MODEL_FALLBACK).strip() or GROQ_MODEL_FALLBACK
     if not api_key:
-        raise ValueError("Enter Gemini AI API key in dashboard/sidebar before comparing datasheets.")
+        raise ValueError("Enter Groq AI API key in dashboard/sidebar before comparing datasheets.")
     if not mpn_url_pairs:
         raise ValueError("Add at least one MPN before running datasheet comparison.")
 
-    timeout_sec = int(timeout_sec or GEMINI_REQUEST_TIMEOUT_SEC)
-    max_retries = max(1, int(max_retries or GEMINI_REQUEST_RETRIES))
-    parts, status_rows = build_datasheet_parts_for_gemini(mpn_url_pairs, parametric_context=parametric_context)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{parse.quote(model, safe='')}:generateContent"
+    timeout_sec = int(timeout_sec or DATASHEET_AI_REQUEST_TIMEOUT_SEC)
+    max_retries = max(1, int(max_retries or DATASHEET_AI_REQUEST_RETRIES))
+    messages, status_rows = build_datasheet_messages_for_ai(mpn_url_pairs, parametric_context=parametric_context)
     payload = {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0.05, "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS},
+        "model": model,
+        "messages": messages,
+        "temperature": 0.05,
+        "max_tokens": DATASHEET_AI_MAX_OUTPUT_TOKENS,
     }
 
     last_error = None
@@ -1961,9 +1969,8 @@ def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_con
     for attempt in range(1, max_retries + 1):
         try:
             resp = requests.post(
-                url,
-                params={"key": api_key},
-                headers={"Content-Type": "application/json"},
+                GROQ_CHAT_COMPLETIONS_URL,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json=payload,
                 timeout=(30, timeout_sec),
             )
@@ -1974,21 +1981,19 @@ def call_gemini_datasheet_analysis(api_key, model, mpn_url_pairs, parametric_con
                 time.sleep(min(10, 2 * attempt))
                 continue
             raise RuntimeError(
-                f"Gemini request timed out after {timeout_sec}s read timeout and {max_retries} attempt(s). "
-                "Try fewer MPNs, smaller datasheets, a faster Gemini model, or increase GEMINI_REQUEST_TIMEOUT_SEC. "
+                f"Groq request timed out after {timeout_sec}s read timeout and {max_retries} attempt(s). "
+                "Try fewer MPNs, smaller context, a faster Groq model, or increase DATASHEET_AI_REQUEST_TIMEOUT_SEC. "
                 f"Original error: {ex}"
             )
     if resp is None:
-        raise RuntimeError(f"Gemini request failed before receiving a response: {last_error}")
+        raise RuntimeError(f"Groq request failed before receiving a response: {last_error}")
     if resp.status_code >= 400:
-        raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text[:1000]}")
+        raise RuntimeError(f"Groq API error {resp.status_code}: {resp.text[:1000]}")
     data = resp.json()
     text = ""
-    for cand in data.get("candidates", []) or []:
-        for part in cand.get("content", {}).get("parts", []) or []:
-            text += str(part.get("text", ""))
+    for choice in data.get("choices", []) or []:
+        text += str(choice.get("message", {}).get("content", "") or "")
     return text.strip(), data, status_rows
-
 
 def save_datasheet_analysis(analysis_name, mpn_url_pairs, model, result_markdown, result_json):
     ensure_datasheet_analysis_table()
@@ -1996,14 +2001,14 @@ def save_datasheet_analysis(analysis_name, mpn_url_pairs, model, result_markdown
         conn.execute(
             """
             INSERT INTO datasheet_analysis_cache
-            (analysis_name, mpns, datasheet_urls, gemini_model, result_markdown, result_json, created_at_utc)
+            (analysis_name, mpns, datasheet_urls, ai_model, result_markdown, result_json, created_at_utc)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(analysis_name or "Datasheet comparison").strip(),
                 json.dumps([m for m, _ in mpn_url_pairs], ensure_ascii=False),
                 json.dumps({m: u for m, u in mpn_url_pairs}, ensure_ascii=False),
-                str(model or GEMINI_MODEL_DEFAULT),
+                str(model or GROQ_MODEL_FALLBACK),
                 result_markdown,
                 json.dumps(result_json, ensure_ascii=False),
                 datetime.now(timezone.utc).isoformat(),
@@ -4700,8 +4705,8 @@ with ui_tabs[5]:
 
 
 with ui_tabs[6]:
-    st.subheader("🤖 Datasheet Analyzer (Gemini AI)")
-    st.caption("Add multiple MPNs, resolve datasheet links from DB first, then Digi-Key/Mouser live APIs (or enter URLs manually), then compare parameters using Gemini AI.")
+    st.subheader("🤖 Datasheet Analyzer (Groq AI)")
+    st.caption("Add multiple MPNs, resolve datasheet links from DB first, then Digi-Key/Mouser live APIs (or enter URLs manually), then compare parameters using Groq AI.")
 
     if "datasheet_analyzer_mpns" not in st.session_state:
         st.session_state["datasheet_analyzer_mpns"] = []
@@ -4775,35 +4780,35 @@ with ui_tabs[6]:
     )
     analyzer_dk_sandbox = src2.toggle("Use Digi-Key Sandbox", value=False, key="datasheet_analyzer_dk_sandbox")
 
-    model = st.text_input("Gemini Model", value=GEMINI_MODEL_DEFAULT, key="datasheet_analyzer_model")
+    model = st.text_input("Groq Model", value=GROQ_MODEL_FALLBACK, key="datasheet_analyzer_model")
     gctl1, gctl2 = st.columns(2)
-    gemini_timeout_sec = gctl1.number_input(
-        "Gemini read timeout (seconds)",
+    ai_timeout_sec = gctl1.number_input(
+        "Groq read timeout (seconds)",
         min_value=120,
         max_value=1800,
-        value=int(GEMINI_REQUEST_TIMEOUT_SEC),
+        value=int(DATASHEET_AI_REQUEST_TIMEOUT_SEC),
         step=60,
         key="datasheet_analyzer_timeout_sec",
         help="Large datasheet PDFs and full component-engineer tables can take several minutes.",
     )
-    gemini_retries = gctl2.number_input(
-        "Gemini retry attempts",
+    ai_retries = gctl2.number_input(
+        "Groq retry attempts",
         min_value=1,
         max_value=5,
-        value=int(GEMINI_REQUEST_RETRIES),
+        value=int(DATASHEET_AI_REQUEST_RETRIES),
         step=1,
         key="datasheet_analyzer_retry_attempts",
     )
     api_key = st.text_input(
-        "Gemini AI API Key",
-        value=st.session_state.get("gemini_api_key", GEMINI_API_KEY_FALLBACK),
+        "Groq AI API Key",
+        value=st.session_state.get("datasheet_ai_api_key", GROQ_API_KEY_FALLBACK),
         type="password",
         key="datasheet_analyzer_api_key",
         help="You can also enter this once in the sidebar Global Settings.",
     )
     analysis_name = st.text_input("Analysis Name", value="Datasheet comparison", key="datasheet_analyzer_name")
 
-    if st.button("🔍 Compare Datasheets with Gemini", key="datasheet_analyzer_compare_btn"):
+    if st.button("🔍 Compare Datasheets with Groq", key="datasheet_analyzer_compare_btn"):
         try:
             with st.spinner("Finding datasheet links from DB / Digi-Key / Mouser..."):
                 pairs, resolve_status = resolve_datasheet_urls_for_analyzer(
@@ -4833,14 +4838,14 @@ with ui_tabs[6]:
             if parametric_rows:
                 with st.expander("View Mouser/Digi-Key parametric fallback rows", expanded=False):
                     st.dataframe(pd.DataFrame(parametric_rows), width="stretch", hide_index=True)
-            with st.spinner("Gemini is reading datasheets and extracting table-wise parameters..."):
-                result_text, raw_json, attach_status = call_gemini_datasheet_analysis(api_key, model, pairs, parametric_context=parametric_context, timeout_sec=gemini_timeout_sec, max_retries=gemini_retries)
+            with st.spinner("Groq is analyzing datasheet context and extracting table-wise parameters..."):
+                result_text, raw_json, attach_status = call_groq_datasheet_analysis(api_key, model, pairs, parametric_context=parametric_context, timeout_sec=ai_timeout_sec, max_retries=ai_retries)
                 save_datasheet_analysis(analysis_name, pairs, model, result_text, raw_json)
             st.success("Datasheet analysis complete and saved to DB table: datasheet_analysis_cache")
             st.markdown("#### Datasheet attachment status")
             st.dataframe(pd.DataFrame(attach_status), width="stretch", hide_index=True)
-            st.markdown("#### Gemini Datasheet Parameter Comparison")
-            st.markdown(result_text or "No text returned by Gemini.")
+            st.markdown("#### Groq Datasheet Parameter Comparison")
+            st.markdown(result_text or "No text returned by Groq.")
             st.download_button(
                 "⬇️ Download Analysis Markdown",
                 data=(result_text or "").encode("utf-8"),
@@ -4860,9 +4865,10 @@ with ui_tabs[6]:
             st.error(f"Datasheet analyzer failed: {ex}")
 
     if DB_PATH.exists():
+        ensure_datasheet_analysis_table()
         with sqlite3.connect(DB_PATH) as conn:
             history_df = pd.read_sql(
-                "SELECT id, analysis_name, mpns, gemini_model, created_at_utc FROM datasheet_analysis_cache ORDER BY id DESC LIMIT 20",
+                "SELECT id, analysis_name, mpns, ai_model, created_at_utc FROM datasheet_analysis_cache ORDER BY id DESC LIMIT 20",
                 conn,
             )
         st.markdown("#### Recent Datasheet Analyses")
