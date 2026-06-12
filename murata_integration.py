@@ -8,15 +8,7 @@ MURATA_API_BASE_URL = "https://api.murata.com"
 MURATA_API_VERSION = "v1"
 
 def get_murata_headers(api_key):
-    """
-    Create headers for Murata API requests
-    
-    Args:
-        api_key: Murata API Key
-        
-    Returns:
-        dict: Headers for API requests
-    """
+    """Create headers for Murata API requests"""
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -26,17 +18,7 @@ def get_murata_headers(api_key):
 
 
 def search_murata_component(mpn, api_key, timeout=30):
-    """
-    Search for a component on Murata using MPN
-    
-    Args:
-        mpn: Manufacturer Part Number
-        api_key: Murata API Key
-        timeout: Request timeout in seconds
-        
-    Returns:
-        dict: Component details from Murata API or None
-    """
+    """Search for a component on Murata using MPN"""
     if not api_key or not mpn:
         return None
     
@@ -61,15 +43,8 @@ def search_murata_component(mpn, api_key, timeout=30):
 
 def get_murata_component_details(mpn, api_key, timeout=30):
     """
-    Get comprehensive component details from Murata
-    
-    Args:
-        mpn: Manufacturer Part Number
-        api_key: Murata API Key
-        timeout: Request timeout in seconds
-        
-    Returns:
-        dict: Component details including specifications, pricing, stock
+    Get comprehensive component details from Murata normalized to match existing structure
+    Returns format compatible with Mouser/Digi-Key payloads
     """
     if not api_key or not mpn:
         return None
@@ -84,22 +59,57 @@ def get_murata_component_details(mpn, api_key, timeout=30):
         data = response.json()
         
         if data:
-            return {
-                'mpn': mpn,
-                'murata_part_number': data.get('partNumber', ''),
-                'product_name': data.get('productName', ''),
-                'category': data.get('category', ''),
-                'description': data.get('description', ''),
-                'manufacturer': data.get('manufacturer', 'Murata'),
-                'specifications': data.get('specifications', {}),
-                'datasheet_url': data.get('datastoreUrl', ''),
-                'product_url': data.get('productUrl', ''),
-                'pricing': data.get('pricing', {}),
-                'stock_info': data.get('inventory', {}),
-                'rohs_status': data.get('rohsStatus', ''),
-                'lifecycle_status': data.get('lifecycleStatus', ''),
-                'timestamp': datetime.now(timezone.utc).isoformat(),
+            # Normalize response to match existing part structure
+            normalized = {
+                "parts": [{
+                    "Requested MPN": mpn,
+                    "Supplier Part Number": data.get('partNumber', ''),
+                    "Manufacturer Part Number": data.get('partNumber', ''),
+                    "Manufacturer": "Murata",
+                    "Description": data.get('productName', ''),
+                    "Category": data.get('category', ''),
+                    "Lifecycle Status": data.get('lifecycleStatus', ''),
+                    "Quantity Available": int(data.get('inventory', {}).get('available', 0) if isinstance(data.get('inventory'), dict) else 0),
+                    "Lead Time Weeks": data.get('leadTime', ''),
+                    "Data Sheet URL": data.get('datastoreUrl', ''),
+                    "Product URL": data.get('productUrl', ''),
+                    "ROHS": data.get('rohsStatus', ''),
+                }],
+                "pricing": [],
+                "attributes": [],
+                "documents": [],
             }
+            
+            # Add pricing if available
+            pricing = data.get('pricing', {})
+            if isinstance(pricing, dict):
+                for qty, price in pricing.items():
+                    normalized["pricing"].append({
+                        "Requested MPN": mpn,
+                        "Break Quantity": qty,
+                        "Unit Price": price,
+                        "Currency": "USD"
+                    })
+            
+            # Add specifications as attributes
+            specs = data.get('specifications', {})
+            if isinstance(specs, dict):
+                for key, value in specs.items():
+                    normalized["attributes"].append({
+                        "Requested MPN": mpn,
+                        "Attribute": str(key),
+                        "Value": str(value),
+                    })
+            
+            # Add datasheet to documents
+            if data.get('datastoreUrl'):
+                normalized["documents"].append({
+                    "Requested MPN": mpn,
+                    "Type": "Datasheet",
+                    "URL": data.get('datastoreUrl', '')
+                })
+            
+            return normalized
         return None
     except requests.exceptions.RequestException as ex:
         print(f"Murata API details error: {ex}")
@@ -107,17 +117,7 @@ def get_murata_component_details(mpn, api_key, timeout=30):
 
 
 def get_murata_stock(mpn, api_key, timeout=30):
-    """
-    Get stock information for a Murata component
-    
-    Args:
-        mpn: Manufacturer Part Number
-        api_key: Murata API Key
-        timeout: Request timeout in seconds
-        
-    Returns:
-        dict: Stock information or None
-    """
+    """Get stock information for a Murata component"""
     if not api_key or not mpn:
         return None
     
@@ -135,19 +135,24 @@ def get_murata_stock(mpn, api_key, timeout=30):
         return None
 
 
+def check_murata_availability(mpn, api_key, timeout=30):
+    """
+    Check if component is available in Murata
+    Returns: (is_available: bool, stock_quantity: int, error_msg: str)
+    """
+    try:
+        details = get_murata_component_details(mpn, api_key, timeout)
+        if details and details.get("parts"):
+            part = details["parts"][0]
+            qty = int(part.get("Quantity Available", 0) or 0)
+            return qty > 0, qty, ""
+        return False, 0, "Component not found in Murata"
+    except Exception as ex:
+        return False, 0, str(ex)
+
+
 def get_murata_pricing(mpn, api_key, quantity=1, timeout=30):
-    """
-    Get pricing information for a Murata component
-    
-    Args:
-        mpn: Manufacturer Part Number
-        api_key: Murata API Key
-        quantity: Quantity for pricing
-        timeout: Request timeout in seconds
-        
-    Returns:
-        dict: Pricing information or None
-    """
+    """Get pricing information for a Murata component"""
     if not api_key or not mpn:
         return None
     
@@ -170,17 +175,7 @@ def get_murata_pricing(mpn, api_key, quantity=1, timeout=30):
 
 
 def get_murata_datasheet(mpn, api_key, timeout=30):
-    """
-    Get datasheet URL for a Murata component
-    
-    Args:
-        mpn: Manufacturer Part Number
-        api_key: Murata API Key
-        timeout: Request timeout in seconds
-        
-    Returns:
-        str: Datasheet URL or None
-    """
+    """Get datasheet URL for a Murata component"""
     if not api_key or not mpn:
         return None
     
@@ -199,17 +194,7 @@ def get_murata_datasheet(mpn, api_key, timeout=30):
 
 
 def search_murata_by_category(category, api_key, timeout=30):
-    """
-    Search Murata components by category
-    
-    Args:
-        category: Product category
-        api_key: Murata API Key
-        timeout: Request timeout in seconds
-        
-    Returns:
-        dict: Search results or None
-    """
+    """Search Murata components by category"""
     if not api_key or not category:
         return None
     
@@ -233,16 +218,7 @@ def search_murata_by_category(category, api_key, timeout=30):
 
 
 def validate_murata_api_key(api_key, timeout=30):
-    """
-    Validate Murata API Key
-    
-    Args:
-        api_key: Murata API Key to validate
-        timeout: Request timeout in seconds
-        
-    Returns:
-        bool: True if valid, False otherwise
-    """
+    """Validate Murata API Key"""
     if not api_key:
         return False
     
